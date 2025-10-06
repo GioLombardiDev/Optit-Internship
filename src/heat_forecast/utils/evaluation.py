@@ -883,6 +883,158 @@ def plot_cv_metric_by_cutoff(
     
     return fig
 
+import pandas as pd
+from typing import Optional, List
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from IPython.display import HTML, display
+import plotly.express as px
+
+def display_scrollable(fig: go.Figure, container_width: str = "100%", max_height: Optional[int] = None):
+    """
+    Display a Plotly figure inside a horizontally scrollable container.
+    You can call this any time, even after updating fig width/height.
+
+    Parameters
+    ----------
+    fig : go.Figure
+        The Plotly figure to render.
+    container_width : str, default "100%"
+        CSS width of the outer container (e.g., "100%", "900px").
+    max_height : int | None
+        If provided, fixes the container's max height and enables vertical scrolling.
+    """
+    style = f"width:{container_width}; overflow-x:auto; border:0; padding:0; margin:0;"
+    if max_height is not None:
+        style += f" max-height:{max_height}px; overflow-y:auto;"
+    html = fig.to_html(include_plotlyjs="cdn", full_html=False)
+    display(HTML(f'<div style="{style}">{html}</div>'))
+
+def plotly_cv_metric_by_cutoff(
+    combined_results: pd.DataFrame,
+    metric: str = "mae",
+    models: Optional[List[str]] = None,
+    height_per_row: int = 320,
+    width: int = 1400,
+    title_suffix: Optional[str] = None,
+) -> go.Figure:
+    """
+    Plot a grid of grouped bar charts (one row per `unique_id`) showing cross-validation
+    scores by cutoff date and model, using Plotly (graph_objects).
+
+    Parameters
+    ----------
+    combined_results : pandas.DataFrame
+        Must include:
+        - 'unique_id' (str): series identifier
+        - 'metric' (str): metric name
+        - 'cutoff' (datetime64): forecast origin
+        - one column per model (numeric scores)
+    metric : str, default "mae"
+        Which metric rows to plot.
+    models : list[str] | None, default None
+        Subset of model columns to display. If None, all model columns found are used.
+    height_per_row : int, default 320
+        Plot height per subplot row (pixels).
+    width : int, default 1400
+        Overall figure width (pixels). You can update this later via fig.update_layout(width=...).
+
+    Returns
+    -------
+    go.Figure
+        The Plotly figure object.
+    """
+    # 1) Filter metric
+    df = combined_results.loc[combined_results["metric"] == metric].copy()
+    if df.empty:
+        raise ValueError(f"No rows found for metric='{metric}'")
+
+    # 2) Identify model columns
+    meta_cols = {"unique_id", "metric", "cutoff"}
+    all_model_cols = [c for c in df.columns if c not in meta_cols]
+    if not all_model_cols:
+        raise ValueError("No model columns found (columns other than 'unique_id','metric','cutoff').")
+
+    if models is not None:
+        if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
+            raise ValueError("`models` should be None or a list[str].")
+        missing = [m for m in models if m not in all_model_cols]
+        if missing:
+            raise ValueError(f"Models not found: {missing}. Available: {all_model_cols}")
+        model_cols = models
+    else:
+        model_cols = all_model_cols
+
+    # 3) Prepare list of series (facilities)
+    series_list = sorted(df["unique_id"].unique())
+    nrows = len(series_list)
+
+    # 4) Build subplots
+    fig = make_subplots(
+        rows=nrows,
+        cols=1,
+        shared_xaxes=False,
+        vertical_spacing=0.08,
+        subplot_titles=[f"Series {sid}" for sid in series_list],
+    )
+
+    # Choose a pleasant qualitative palette and map per model
+    palette = px.colors.qualitative.Plotly
+    colors = {m: palette[i % len(palette)] for i, m in enumerate(model_cols)}
+
+    # 5) Add one row per series
+    for r, sid in enumerate(series_list, start=1):
+        sub = df.loc[df["unique_id"] == sid].copy()
+        if sub.empty:
+            continue
+
+        # Sort by cutoff; create string labels for tidy x-axis
+        sub = sub.sort_values("cutoff")
+        sub["cutoff_str"] = sub["cutoff"].dt.strftime("%Y-%m-%d")
+        x = sub["cutoff_str"].tolist()
+
+        # Add one trace per model (grouped bars)
+        for m in model_cols:
+            y_vals = sub[m].tolist()
+            fig.add_trace(
+                go.Bar(
+                    name=m,
+                    x=x,
+                    y=y_vals,
+                    marker_color=colors[m],
+                    cliponaxis=False,  # helps prevent cutoff of text
+                    hovertemplate=(
+                        f"<b>Series:</b> {sid}<br>"
+                        f"<b>Model:</b> {m}<br>"
+                        "<b>Cutoff:</b> %{x}<br>"
+                        f"<b>{metric.upper()}:</b> %{{y:.3f}}<extra></extra>"
+                    ),
+                    showlegend=(r == 1),  # show legend only once (top subplot)
+                ),
+                row=r,
+                col=1,
+            )
+
+        # Cosmetics per-row
+        fig.update_yaxes(title_text=metric, row=r, col=1)
+        fig.update_xaxes(title_text="Cutoff Date", tickangle=45, row=r, col=1)
+
+    # 6) Global layout
+    fig.update_layout(
+        barmode="group",
+        width=width,
+        height=max(300, nrows * height_per_row),
+        title_text=f"Cross-Validation {metric} Results by Cutoff and Model" + (f" - {title_suffix}" if title_suffix else ""),
+        title_x=0.5,
+        legend_title_text="Model",
+        margin=dict(l=60, r=20, t=70, b=60),
+        uniformtext_minsize=8,
+        uniformtext_mode="hide",
+    )
+
+    return fig
+
+
 def compute_loss_diff_stats(
         combined_results: pd.DataFrame,
         baseline_model: str = 'Naive24h'

@@ -809,7 +809,7 @@ class TFScheduler:
         self._warmup_ep     = w
         self._zero_start_ep = z
 
-        self.logger = self.logger or logging.getLogger("pipeline.lstm")
+        self.logger = self.logger or logging.getLogger(__name__)
         self.logger.info(f"[tf] mode={self.mode}, warmup_end_ep={self._warmup_ep+1}, late_tf_start_ep={self._zero_start_ep+1} (both inclusive and 1-based), initial_tf={self.initial_tf}, late_tf={self.late_tf}, spike_level={self.spike_level}, spike_period={self.spike_period}")
 
     def get_tf_ratio(self, current_epoch) -> float:
@@ -912,7 +912,7 @@ class LSTMTrainer:
         """
         self.model = model.to(device)
         self.device = device
-        self._logger = logger or logging.getLogger("pipeline.lstm")
+        self._logger = logger or logging.getLogger(__name__)
         self.seed = tf_seed
 
         self.debug = debug or DebugConfig(enabled=False)
@@ -1570,7 +1570,7 @@ class LSTMTrainer:
             vals = self.val_losses_orig
             best_idx = best_epoch_zb
             lo = max(0, best_idx - 1)
-            hi = min(len(vals), best_idx + 1 + 3)
+            hi = min(len(vals), best_idx + 1 + 2)
             avg_near_best = float(np.mean(vals[lo:hi])) if len(vals) else float('nan')
 
             self._logger.info(
@@ -1949,7 +1949,7 @@ class LSTMPipeline:
         self._target_df = target_df
         self._aux_df = aux_df
         self.config = config
-        self._logger = logger or logging.getLogger("pipeline.lstm")
+        self._logger = logger or logging.getLogger(__name__)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # internal attributes initialized during data preparation
@@ -2353,6 +2353,7 @@ class LSTMPipeline:
         "Make train / val (or test) loaders"
 
         logger = self._logger
+        gap_hours = int(self.config.data.gap_hours)
 
         # prep & sanity
         if self._endog_df is None or self._exog_df is None or self._y is None or self._y_levels is None:
@@ -2365,9 +2366,6 @@ class LSTMPipeline:
         }.items():
             if ts is not None and not isinstance(ts, pd.Timestamp):
                 raise ValueError(f"{name} must be a pd.Timestamp or None.")
-        gap_hours = int(self.config.data.gap_hours)
-        if not isinstance(gap_hours, int) or gap_hours < 0:
-            raise ValueError("gap_hours must be a non-negative integer.")
 
         # resolve ranges with the tiny helper
         ranges = self._resolve_ranges(
@@ -2423,7 +2421,7 @@ class LSTMPipeline:
             yl_tr = self._y_levels.loc[self._start_train:cut]
             ds_tr = self._dataset_from_slices(y_tr, en_tr, ex_tr, yl_tr, global_stats=global_stats, norm_cfg=norm_cfg_for_build)
             train_loader = self._build_loader(ds_tr, batch_size=bs, shuffle=shuf, num_workers=nw, pin_memory=pin, seed=seed_train)
-            parts.append(f"train(n={len(ds_tr)}, bs={bs}, n_batches={len(train_loader)}, start={self._start_train}, end={cut})")
+            parts.append(f"train(n={len(ds_tr)}, n_batches={len(train_loader)}, start={self._start_train}, end={cut})")
 
         if want_val:
             if want_train:
@@ -2432,22 +2430,10 @@ class LSTMPipeline:
                                                         start=self._start_val, end=self._end_val, T_in=T_in, y_levels=self._y_levels)
             ds_v = self._dataset_from_slices(y_v, en_v, ex_v, yl_v, global_stats=global_stats, norm_cfg=norm_cfg_for_build)
             val_loader = self._build_loader(ds_v, batch_size=bs, shuffle=False, num_workers=nw, pin_memory=pin, seed=seed_val)
-            parts.append(f"val(n={len(ds_v)}, bs={bs}, n_batches={len(val_loader)}, start={self._start_val}, end={self._end_val})")
+            parts.append(f"val(n={len(ds_v)}, n_batches={len(val_loader)}, start={self._start_val}, end={self._end_val})")
 
-        # Log summary
-        train_n = len(ds_tr) if want_train else 0
-        val_n   = len(ds_v)  if want_val   else 0
-        train_batches = len(train_loader) if want_train and train_loader is not None else 0
-        val_batches   = len(val_loader)   if want_val   and val_loader   is not None else 0
-
-        logger.info(
-            "[loaders] "
-            f"loaders built: used "
-            f"stride={self.config.data.stride}, "
-            f"bs={self.config.data.batch_size}, gap={int(self.config.data.gap_hours)}h, "
-            f"norm={norm_mode}{' (reused)' if (use_global and not want_train) else ' (inferred from train)'}, "
-            f"shuffle_train={self.config.data.shuffle_train}"
-        )
+        logger.info("[loaders] loaders built: " + (" | ".join(parts) if parts else "none")
+                    + f" | bs={bs}, norm_mode={'global' if (use_global and global_stats is not None) else 'none/per-sample'}, gap_hours={gap_hours}, stride={self.config.data.stride}")
 
         return train_loader, val_loader
 
@@ -2742,9 +2728,7 @@ class LSTMPipeline:
             Required relative improvement for PASS (e.g., 0.95 = 95% drop).
         restore_weights : bool, default=True
             If True, restore original model params after the test.
-        n_samples : int | None, default=None
-            Number of samples to use (randomly drawn from `train_loader.dataset`).
-            If None, use `train_loader.batch_size` or min(32, dataset size).
+        n_samples : int | None
         gen_seed : int | None
 
         Returns
@@ -2873,7 +2857,7 @@ class LSTMPipeline:
         self,
         val_loader: DataLoader | None = None,
         cutoff: pd.Timestamp | None = None,
-        alias: str = "LSTM",
+        alias: str = "LSTM"
     ) -> pd.DataFrame:
         """
         Generate predictions on original target scale.

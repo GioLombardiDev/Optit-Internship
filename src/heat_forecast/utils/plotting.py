@@ -1,3 +1,4 @@
+from pydoc import html
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -15,6 +16,7 @@ from matplotlib import colors
 import plotly.graph_objects as go
 from matplotlib.ticker import FuncFormatter, MultipleLocator
 import ipywidgets as widgets
+from IPython.display import HTML
 
 from .transforms import make_is_winter, get_lambdas, make_transformer, transform_column
 
@@ -708,7 +710,7 @@ def plot_cutoff_results_with_exog(
 
     return fig
 
-def interactive_plot_cutoff_results(
+def interactive_plot_cutoff_results_v0(
     target_df: pd.DataFrame,
     cv_df: pd.DataFrame,
     *,
@@ -787,7 +789,7 @@ def interactive_plot_cutoff_results(
         end = min(len(cutoffs), center_cutoff_index + half_window + 1 + int(n_windows % 2 == 0))
         selected_cutoffs = cutoffs[start:end]
 
-        fig = plot_cutoff_results_with_exog(
+        mfig = plot_cutoff_results_with_exog(
             target_df=target_df,
             aux_df=aux_df,
             exog_vars=exog_vars,
@@ -804,15 +806,105 @@ def interactive_plot_cutoff_results(
             figsize=figsize
         )
 
-        plt.show()          # Show it manually
-        plt.close('all')    # Prevent Jupyter from showing it again
-
+        plt.show(mfig)
+        #plt.close('all')    # Prevent Jupyter from showing it again
+        
         return None
 
     # Hook up the slider
     widgets.interact(interactive_plot, center_cutoff_index=slider)
 
     return None
+
+import ipywidgets as widgets
+from plotly.tools import mpl_to_plotly
+
+def plotly_forecasts_with_exog(
+    *,
+    target_df: pd.DataFrame,
+    cv_df: pd.DataFrame,
+    aux_df=None,
+    exog_vars=None,
+    n_windows: int = 5,
+    models=None,
+    id=None,
+    add_context: bool = False,
+    levels=None,
+    alpha: float = 0.9,
+    order_of_models=None,
+    figsize=None,
+    only_aligned_to_day: bool = True,
+    start_offset: int = 48,
+    end_offset: int = 48,
+):
+    # --- prep once
+    cv_df = cv_df.copy()
+    cv_df["cutoff"] = pd.to_datetime(cv_df["cutoff"])
+    if only_aligned_to_day:
+        cv_df = cv_df[cv_df["cutoff"].dt.hour == 23].copy()
+
+    cutoffs = sorted(cv_df["cutoff"].unique())
+    if len(cutoffs) < max(1, n_windows):
+        raise ValueError("Not enough cutoffs for the requested window size.")
+
+    slider = widgets.IntSlider(
+        value=len(cutoffs)//2, min=0, max=len(cutoffs)-1, step=1,
+        description="Cutoff idx:", continuous_update=False
+    )
+    out = widgets.Output()
+
+    def _strip_legends_inplace(mfig):
+        for ax in mfig.get_axes():
+            leg = ax.get_legend()
+            if leg is not None:
+                try: leg.remove()
+                except Exception: leg.set_visible(False)
+            try: ax.legend_ = None
+            except Exception: pass
+
+    def _select(idx: int):
+        half = (n_windows-1)//2
+        start = max(0, idx - half)
+        end   = min(len(cutoffs), idx + half + 1 + int(n_windows % 2 == 0))
+        return cutoffs[start:end]
+
+    def _render(idx: int):
+        selected_cutoffs = _select(idx)
+
+        mfig = plot_cutoff_results_with_exog(
+            target_df=target_df,
+            cv_df=cv_df,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            aux_df=aux_df,
+            exog_vars=exog_vars,
+            cutoffs=selected_cutoffs,
+            models=models,
+            id=id,
+            add_context=add_context,
+            levels=levels,
+            alpha=alpha,
+            order_of_models=order_of_models,
+            figsize=figsize,
+        )
+        _strip_legends_inplace(mfig)
+        pfig = mpl_to_plotly(mfig)
+        plt.close(mfig)  # prevent MPL from also rendering
+
+        with out:
+            out.clear_output(wait=True)  # ← ensures ONLY one figure is shown
+            display(pfig)                # ← no fig.show(), no print()
+
+    def _on_change(change):
+        if change["name"] == "value":
+            _render(change["new"])
+
+    slider.observe(_on_change, names="value")
+    _render(slider.value)  # initial draw
+    
+    ui = widgets.VBox([slider, out])
+    display(ui)
+    return
 
 def custom_plot_results(
     target_df: pd.DataFrame,

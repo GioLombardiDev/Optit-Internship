@@ -688,8 +688,8 @@ final_v2_F1_doc = SuggesterDoc(
         ParamInt("model.num_layers", 1, 2),
         ParamInt("model.hidden_size", 32, 128, step=16),
         ParamFloat("model.dropout", 0.0, 0.3),
-        ParamFloat("train.learning_rate", 5e-4, 2e-3, log=True),
-        ParamInt("train.drop_epoch", 4, 8, step=2),
+        ParamFloat("train.learning_rate", 1e-4, 2e-3, log=True),
+        ParamInt("train.drop_epoch", 4, 7, step=3),
     ],
     notes=[
         "Fixed params: input_len=72, head='linear', output_len=168 (7 days ahead), "
@@ -722,11 +722,244 @@ def suggester_final_v2_F1(trial: optuna.trial.Trial, base: LSTMRunConfig) -> LST
     cfg.features.include_exog_lags = True
 
     # ---- Training/Data ----
-    cfg.train.learning_rate  = trial.suggest_float("train.learning_rate", 5e-4, 2e-3, log=True)
+    cfg.train.learning_rate  = trial.suggest_float("train.learning_rate", 1e-4, 2e-3, log=True)
     cfg.train.grad_clip_max_norm = 10.0 # (default)
 
     cfg.train.use_lr_drop    = True 
-    drop_epoch   = trial.suggest_int("train.drop_epoch", 4, 8, step=2)
+    drop_epoch   = trial.suggest_int("train.drop_epoch", 4, 7, step=3)
+    cfg.train.lr_drop_at_epoch = drop_epoch
+    cfg.train.lr_drop_factor   = 0.3
+    cfg.train.n_epochs       = 25
+    cfg.train.es_start_epoch = 5
+    cfg.train.es_rel_delta   = 0.005
+    cfg.data.batch_size      = 64
+    cfg.norm.mode            = "global"
+    cfg.model.use_ar         = "24h"
+    cfg.train.tf_drop_epochs = drop_epoch
+
+    return cfg
+
+final_v2_NAR_F1_doc = SuggesterDoc(
+    summary="Final LSTM suggester v2, non-ar (F1)",
+    params=[
+        ParamInt("model.num_layers", 1, 2),
+        ParamInt("model.hidden_size", 32, 128, step=16),
+        ParamFloat("model.dropout", 0.0, 0.3),
+        ParamFloat("train.learning_rate", 1e-4, 2e-3, log=True),
+        ParamInt("train.drop_epoch", 4, 7, step=3),
+    ],
+    notes=[
+        "Fixed params: input_len=72, head='linear', output_len=168 (7 days ahead), "
+        "use_ar=none, norm.mode='global', "
+        "n_epochs=25 with early stopping (es_start_epoch=5, es_rel_delta=0.5%), "
+        "use_lr_drop=True (factor=0.3, lr_drop_at_epoch=train.drop_epoch), "
+        "max_walltime_sec=600 (10 minutes per trial).",
+        "Fixed features: include_exog_lags=True.",
+        "train.tf_drop_epochs is set to `train.drop_epoch`.",
+        "data.batch_size fixed to 64.",
+        "Other params inherit defaults from `base`.",
+    ],
+)
+
+
+@register_suggester("final_v2_NAR_F1", doc=final_v2_NAR_F1_doc)
+def suggester_final_v2_NAR_F1(trial: optuna.trial.Trial, base: LSTMRunConfig) -> LSTMRunConfig:
+    cfg = copy.deepcopy(base)
+    cfg.train.max_walltime_sec = 600  # 10 minutes per trial max
+    cfg.model.output_len = 168 # 7days ahead
+
+    # ---- Model ----
+    cfg.model.input_len   = 72
+    cfg.model.num_layers  = trial.suggest_int("model.num_layers", 1, 2)
+    cfg.model.head        = "linear"
+    cfg.model.hidden_size = trial.suggest_int("model.hidden_size", 32, 128, step=16)
+    cfg.model.dropout     = trial.suggest_float("model.dropout", 0.0, 0.3)
+
+    # ---- Features ----
+    cfg.features.include_exog_lags = True
+
+    # ---- Training/Data ----
+    cfg.train.learning_rate  = trial.suggest_float("train.learning_rate", 1e-4, 2e-3, log=True)
+    cfg.train.grad_clip_max_norm = 10.0 # (default)
+
+    cfg.train.use_lr_drop    = True 
+    drop_epoch   = trial.suggest_int("train.drop_epoch", 4, 7, step=3)
+    cfg.train.lr_drop_at_epoch = drop_epoch
+    cfg.train.lr_drop_factor   = 0.3
+    cfg.train.n_epochs       = 25
+    cfg.train.es_start_epoch = 5
+    cfg.train.es_rel_delta   = 0.005
+    cfg.data.batch_size      = 64
+    cfg.norm.mode            = "global"
+    cfg.model.use_ar         = "none"
+    cfg.train.tf_drop_epochs = drop_epoch
+
+    return cfg
+
+final_v2_F2_doc = SuggesterDoc(
+    summary="Final LSTM suggester v2 (F2)",
+    params=[
+        ParamInt("model.num_layers", 1, 2),
+        ParamInt("model.hidden_size", 16, 112, step=16),
+        ParamFloat("model.dropout", 0.0, 0.3),
+        ParamFloat("train.learning_rate", 1e-4, 2e-3, log=True),
+        ParamInt("train.drop_epoch", 4, 7, step=3),
+    ],
+    notes=[
+        "Fixed params: input_len=72, head='linear', output_len=168 (7 days ahead), "
+        "use_ar=24h, norm.mode='global', "
+        "n_epochs=25 with early stopping (es_start_epoch=5, es_rel_delta=0.5%), "
+        "use_lr_drop=True (factor=0.3, lr_drop_at_epoch=train.drop_epoch), "
+        "max_walltime_sec=600 (10 minutes per trial).",
+        "Fixed features: include_exog_lags=True.",
+        "train.tf_drop_epochs is set to `train.drop_epoch`.",
+        "data.batch_size fixed to 64.",
+        "Other params inherit defaults from `base`.",
+    ],
+)
+
+
+@register_suggester("final_v2_F2", doc=final_v2_F2_doc)
+def suggester_final_v2_F2(trial: optuna.trial.Trial, base: LSTMRunConfig) -> LSTMRunConfig:
+    cfg = copy.deepcopy(base)
+    cfg.train.max_walltime_sec = 600  # 10 minutes per trial max
+    cfg.model.output_len = 168 # 7days ahead
+
+    # ---- Model ----
+    cfg.model.input_len   = 72
+    cfg.model.num_layers  = trial.suggest_int("model.num_layers", 1, 2)
+    cfg.model.head        = "linear"
+    cfg.model.hidden_size = trial.suggest_int("model.hidden_size", 16, 112, step=16)
+    cfg.model.dropout     = trial.suggest_float("model.dropout", 0.0, 0.3)
+
+    # ---- Features ----
+    cfg.features.include_exog_lags = True
+
+    # ---- Training/Data ----
+    cfg.train.learning_rate  = trial.suggest_float("train.learning_rate", 1e-4, 2e-3, log=True)
+    cfg.train.grad_clip_max_norm = 10.0 # (default)
+
+    cfg.train.use_lr_drop    = True 
+    drop_epoch   = trial.suggest_int("train.drop_epoch", 4, 7, step=3)
+    cfg.train.lr_drop_at_epoch = drop_epoch
+    cfg.train.lr_drop_factor   = 0.3
+    cfg.train.n_epochs       = 25
+    cfg.train.es_start_epoch = 5
+    cfg.train.es_rel_delta   = 0.005
+    cfg.data.batch_size      = 64
+    cfg.norm.mode            = "global"
+    cfg.model.use_ar         = "24h"
+    cfg.train.tf_drop_epochs = drop_epoch
+
+    return cfg
+
+final_v2_F3_doc = SuggesterDoc(
+    summary="Final LSTM suggester v2 (F3)",
+    params=[
+        ParamInt("model.num_layers", 1, 2),
+        ParamInt("model.hidden_size", 8, 32, step=8),
+        ParamFloat("model.dropout", 0.0, 0.3),
+        ParamFloat("train.learning_rate", 1e-4, 2e-3, log=True),
+        ParamInt("train.drop_epoch", 4, 7, step=3),
+        ParamFloat("train.weight_decay", 1e-6, 1e-3, log=True),
+        ParamCat("train.use_weight_decay", [False, True]),
+    ],
+    notes=[
+        "Fixed params: input_len=72, head='linear', output_len=168 (7 days ahead), "
+        "use_ar=24h, norm.mode='global', "
+        "n_epochs=25 with early stopping (es_start_epoch=5, es_rel_delta=0.5%), "
+        "use_lr_drop=True (factor=0.3, lr_drop_at_epoch=train.drop_epoch), "
+        "max_walltime_sec=600 (10 minutes per trial).",
+        "Fixed features: include_exog_lags=True.",
+        "train.tf_drop_epochs is set to `train.drop_epoch`.",
+        "data.batch_size fixed to 64.",
+        "Other params inherit defaults from `base`.",
+    ],
+)
+
+
+@register_suggester("final_v2_F3", doc=final_v2_F3_doc)
+def suggester_final_v2_F3(trial: optuna.trial.Trial, base: LSTMRunConfig) -> LSTMRunConfig:
+    cfg = copy.deepcopy(base)
+    cfg.train.max_walltime_sec = 600  # 10 minutes per trial max
+    cfg.model.output_len = 168 # 7days ahead
+
+    # ---- Model ----
+    cfg.model.input_len   = 72
+    cfg.model.num_layers  = trial.suggest_int("model.num_layers", 1, 2)
+    cfg.model.head        = "linear"
+    cfg.model.hidden_size = trial.suggest_int("model.hidden_size", 8, 32, step=8)
+    cfg.model.dropout     = trial.suggest_float("model.dropout", 0.0, 0.3)
+
+    # ---- Features ----
+    cfg.features.include_exog_lags = True
+
+    # ---- Training/Data ----
+    cfg.train.learning_rate  = trial.suggest_float("train.learning_rate", 1e-4, 2e-3, log=True)
+    cfg.train.grad_clip_max_norm = 10.0 # (default)
+
+    cfg.train.use_lr_drop    = True 
+    drop_epoch   = trial.suggest_int("train.drop_epoch", 4, 7, step=3)
+    use_wd = trial.suggest_categorical("train.use_weight_decay", [False, True])
+    cfg.train.weight_decay = (
+        0.0 if not use_wd else trial.suggest_float("train.weight_decay", 1e-6, 1e-2, log=True)
+    )
+    cfg.train.lr_drop_at_epoch = drop_epoch
+    cfg.train.lr_drop_factor   = 0.3
+    cfg.train.n_epochs       = 25
+    cfg.train.es_start_epoch = 5
+    cfg.train.es_rel_delta   = 0.005
+    cfg.data.batch_size      = 64
+    cfg.norm.mode            = "global"
+    cfg.model.use_ar         = "24h"
+    cfg.train.tf_drop_epochs = drop_epoch 
+
+    return cfg
+
+final_v2_F4_doc = SuggesterDoc(
+    summary="Final LSTM suggester v2 (F4)",
+    params=[
+        ParamInt("model.num_layers", 1, 2),
+        ParamInt("model.hidden_size", 8, 56, step=8),
+        ParamFloat("model.dropout", 0.0, 0.3),
+        ParamFloat("train.learning_rate", 1e-4, 2e-3, log=True),
+        ParamInt("train.drop_epoch", 4, 7, step=3),
+    ],
+    notes=[
+        "Fixed params: input_len=72, head='linear', output_len=168 (7 days ahead), "
+        "use_ar=24h, norm.mode='global', "
+        "n_epochs=25 with early stopping (es_start_epoch=5, es_rel_delta=0.5%), "
+        "use_lr_drop=True (factor=0.3, lr_drop_at_epoch=train.drop_epoch), "
+        "max_walltime_sec=600 (10 minutes per trial).",
+        "Fixed features: include_exog_lags=True.",
+        "train.tf_drop_epochs is set to `train.drop_epoch`.",
+        "data.batch_size fixed to 64.",
+        "Other params inherit defaults from `base`.",
+    ],
+)
+
+@register_suggester("final_v2_F4", doc=final_v2_F4_doc)
+def suggester_final_v2_F4(trial: optuna.trial.Trial, base: LSTMRunConfig) -> LSTMRunConfig:
+    cfg = copy.deepcopy(base)
+    cfg.train.max_walltime_sec = 600  # 10 minutes per trial max
+    cfg.model.output_len = 168 # 7days ahead
+
+    # ---- Model ----
+    cfg.model.input_len   = 72
+    cfg.model.num_layers  = trial.suggest_int("model.num_layers", 1, 2)
+    cfg.model.head        = "linear"
+    cfg.model.hidden_size = trial.suggest_int("model.hidden_size", 8, 56, step=8)
+    cfg.model.dropout     = trial.suggest_float("model.dropout", 0.0, 0.3)
+
+    # ---- Features ----
+    cfg.features.include_exog_lags = True
+
+    # ---- Training/Data ----
+    cfg.train.learning_rate  = trial.suggest_float("train.learning_rate", 1e-4, 2e-3, log=True)
+    cfg.train.grad_clip_max_norm = 10.0 # (default)
+
+    cfg.train.use_lr_drop    = True 
+    drop_epoch   = trial.suggest_int("train.drop_epoch", 4, 7, step=3)
     cfg.train.lr_drop_at_epoch = drop_epoch
     cfg.train.lr_drop_factor   = 0.3
     cfg.train.n_epochs       = 25
@@ -798,3 +1031,5 @@ def suggester_final_v3_F1(trial: optuna.trial.Trial, base: LSTMRunConfig) -> LST
         cfg.train.learning_rate = 7e-04
 
     return cfg
+
+

@@ -22,7 +22,7 @@ import warnings
 import logging
 _LOGGER = logging.getLogger(__name__)
 from dataclasses import dataclass, replace, asdict
-from IPython.display import display
+from IPython.display import display, HTML
 
 
 from ..pipeline.lstm import (
@@ -217,6 +217,7 @@ def make_objective(
     aux_id_df: pd.DataFrame | None,
     base_config: LSTMRunConfig,
     *,
+    objective_val: Literal["best", "avg_near_best", "last"] = "best",
     suggest_config: Callable[[optuna.trial.Trial, LSTMRunConfig], LSTMRunConfig],
     start_train: pd.Timestamp | None,
     end_train: pd.Timestamp | None,
@@ -260,7 +261,6 @@ def make_objective(
             train_loader, val_loader = pipe.make_loaders(
                 start_train=start_train, end_train=end_train,
                 start_val=start_val,     end_val=end_val,
-                gap_hours=cfg.data.gap_hours,
             )
 
             # train with pruning support (pipeline forwards `trial` to trainer)
@@ -281,10 +281,17 @@ def make_objective(
             avg_near_best = out.get('avg_near_best')
             trial.set_user_attr("avg_near_best", float(avg_near_best) if avg_near_best is not None else None)
             
-            trial.set_user_attr("last_val", float(trainer.val_losses_orig[-1]) if trainer.val_losses_orig else None)
-            
-            return float(best_val) if best_val is not None else float("inf")
-        
+            last_val = trainer.val_losses_orig[-1] if trainer.val_losses_orig else None
+            trial.set_user_attr("last_val", float(last_val) if last_val is not None else None)
+
+            if objective_val == "avg_near_best":
+                return float(avg_near_best) if avg_near_best is not None else float("inf")
+            if objective_val == "best":
+                return float(best_val) if best_val is not None else float("inf")
+            if objective_val == "last":
+                return float(last_val) if last_val is not None else float("inf")
+            raise ValueError(f"objective must be 'best', 'avg_near_best' or 'last'. Found: {objective_val}")
+
         except RuntimeError as e:
             logger.warning(f"Trial {trial.number} failed: {e}")
             if "out of memory" in str(e).lower():
@@ -320,6 +327,8 @@ class OptunaStudyConfig:
     -------
     study_name: str
         Name of the Optuna study (used for storage + logging).
+    objective: Literal["best", "avg_near_best", "last"] = "best"
+        Whether to minimize or maximize the objective function.
     n_trials: Optional[int] = 50
         Number of trials to run. Ignored for grid search (all grid points run).
     timeout: Optional[float] = None
@@ -377,6 +386,7 @@ class OptunaStudyConfig:
         Number of parameter combinations in the grid.
     """
     study_name: str
+    objective: Literal["best", "avg_near_best", "last"] = "best"
     n_trials: Optional[int] = 50
     timeout: Optional[float] = None
     seed: Optional[int] = None
@@ -415,12 +425,12 @@ class OptunaStudyConfig:
         
         # Defaults for TPE
         if self.sampler == "tpe":
-            # 20% of budget, min 10
+            # 20% or 25% of budget, min 10
             if self.n_startup_trials_sampler is None:
-                self.n_startup_trials_sampler = 10 if self.n_trials is None else max(10, self.n_trials // 5)
-            # Pruner startup: 20% of budget, min 15
+                self.n_startup_trials_sampler = 10 if self.n_trials is None else max(10, self.n_trials * 0.25)
+            # Pruner startup: 20% or 25% of budget, min 15
             if self.pruner != "nop" and self.n_startup_trials_pruner is None:
-                self.n_startup_trials_pruner = 15 if self.n_trials is None else max(15, self.n_trials // 5)
+                self.n_startup_trials_pruner = 15 if self.n_trials is None else max(15, self.n_trials * 0.25)
 
         # internals
         self.grid = None       # for grid search, set by make_sampler
@@ -493,6 +503,7 @@ class OptunaStudyConfig:
             "General": {
                 "study_name": d.pop("study_name"),
                 "n_trials": d.pop("n_trials"),
+                "objective": d.pop("objective", "best"),
                 "timeout": d.pop("timeout"),
                 "seed": d.pop("seed"),
                 "storage": d.pop("storage"),
@@ -540,11 +551,13 @@ def run_study(
         heat_id_df, 
         aux_id_df, 
         base_cfg,
+        objective_val=optuna_cfg.objective,
         suggest_config=suggest_config,
         start_train=start_train, end_train=end_train, 
         start_val=start_val, end_val=end_val,
         logger=logging.getLogger("optuna_run"),
     )
+
     study = optuna.create_study(
         direction="minimize",
         sampler=sampler,
@@ -656,6 +669,7 @@ def continue_study(
         heat_id_df, 
         aux_id_df, 
         base_cfg,
+        objective_val=optuna_cfg.objective,
         suggest_config=suggest_config,
         start_train=start_train, end_train=end_train, 
         start_val=start_val, end_val=end_val,
@@ -993,12 +1007,30 @@ def create_substudy_by_param(
 
 def trials_df(
         study: optuna.study.Study,
-        states: tuple[str] = ("COMPLETE", "PRUNED", "FAIL", "RUNNING", "WAITING"),
-    ) -> pd.DataFrame:
+        states: tuple[str, ...] = ("COMPLETE", "PRUNED", "FAIL", "RUNNING", "WAITING"),
+    ) -> tuple[pd.DataFrame, str]:
     """Collect trial rows with params_ columns and the objective value."""
+    # Build last_epoch from intermediate_values (epoch reported as step, 0-based)
+    last_epoch_by_number = {
+        t.number: (max(t.intermediate_values.keys()) + 1) if t.intermediate_values else None
+        for t in study.trials
+    }
+
+    # Get DataFrame
     df = study.trials_dataframe()
+
+    # Add last_epoch column (not persisted in storage)
+    df["last_epoch"] = df["number"].map(last_epoch_by_number)
+
+    # Rename value to objective (more intuitive)
+    if "value" in df.columns:
+        val_name = study.user_attrs.get("optuna_cfg", {}).get("objective", "best MAE")
+        df = df.rename(columns={"value": val_name})
+    else:
+        raise KeyError("DataFrame missing 'value' column; is the study empty?")
+
     df = df[df["state"].isin(states)].copy()
-    return df
+    return df, val_name
 
 
 def _param_kinds_from_study(study: optuna.study.Study) -> dict[str, str]:
@@ -1120,13 +1152,14 @@ def _get_param(df: pd.DataFrame, param: str) -> pd.Series:
 # ---------------------------
 
 def trials_df_for_display(
-    df: pd.DataFrame,               
+    df: pd.DataFrame, 
+    val_name: str,
+    *,              
     to_exclude: tuple[str, ...] | None = None,
-    value_col: str = "value",
-    ascending: bool = True
+    ascending: bool = True,
 ) -> pd.DataFrame:
     """Display a trials DataFrame with params_ columns and the objective value."""
-    # create a working copy
+    # create a working cop
     df = df.copy()
 
     # exclude uninformative columns
@@ -1144,21 +1177,16 @@ def trials_df_for_display(
     if "state" in df.columns:
         df["state"] = df["state"].astype(str)
 
-    # order by value
-    df = df.sort_values(by="value", ascending=ascending).reset_index(drop=True)
-
     # format duration
     if "duration" in df.columns and is_timedelta64_dtype(df["duration"]):
         df["duration"] = df["duration"].apply(_duration_fmt)
 
     # sort by original 'value', then rename to value_col
-    if "value" in df.columns:
-        df.sort_values(by="value", ascending=ascending, inplace=True, kind="mergesort")
+    if val_name in df.columns:
+        df.sort_values(by=val_name, ascending=ascending, inplace=True, kind="mergesort")
         df.reset_index(drop=True, inplace=True)
-        if value_col != "value":
-            df.rename(columns={"value": value_col}, inplace=True)
     else:
-        pass
+        raise KeyError(f"Value column '{val_name}' not found in DataFrame.")
 
     # format numeric params
     param_cols = _param_cols(df)
@@ -1168,9 +1196,9 @@ def trials_df_for_display(
             df[c] = df[c].map(_fmt)
 
     # format objective
-    if value_col in df.columns and is_numeric_dtype(df[value_col]):
-        fmt_val = _best_num_formatter_for_series(df[value_col])
-        df[value_col] = df[value_col].map(fmt_val)
+    if is_numeric_dtype(df[val_name]):
+        fmt_val = _best_num_formatter_for_series(df[val_name])
+        df[val_name] = df[val_name].map(fmt_val)
 
     # format user_attrs columns
     user_attrs_cols = [c for c in df.columns if c.startswith("user_attrs_")]
@@ -1281,7 +1309,8 @@ def _style_coverage_tables(
 def summarize_params_coverage(
     study: optuna.study.Study,
     df: pd.DataFrame,
-    value_col: str = "value",
+    val_name: str,
+    *,
     max_levels: int = 8,
     bins_for_gap: int = 10,
 ) -> tuple[Styler | None, Styler | None]:
@@ -1296,11 +1325,19 @@ def summarize_params_coverage(
     param_cols = _param_cols(df)
 
     # state masks
+    if val_name not in df.columns:
+        raise KeyError(f"Value column '{val_name}' not found in DataFrame.")
     st = df["state"].astype(str)
-    m_complete = (st == "COMPLETE") & df[value_col].notna()
+    m_complete_inf = (
+        (st == "COMPLETE") &
+        df[val_name].apply(lambda v: pd.isna(v) or np.isinf(v))
+    )
+    if any(m_complete_inf):
+        _LOGGER.warning("There are COMPLETE trials with missing or infinite values in column '%s'", val_name)
+    m_complete = (st == "COMPLETE") & (~m_complete_inf)
     m_pruned   = (st == "PRUNED")
     m_fail     = (st == "FAIL")
-    m_running  = (st == "RUNNING") if "RUNNING" in st.unique() else pd.Series(False, index=df.index)
+    m_running  = (st == "RUNNING")
 
     num_rows, cat_rows = [], []
 
@@ -1545,7 +1582,6 @@ def _bin_param(
         bins_c = pd.Categorical(["all"] * len(d), categories=["all"], ordered=True)
         return Binned(
             bins=bins_c,
-            index=pd.CategoricalIndex(["all"], ordered=True),
             level=["all"],
             x_center=np.array([single_center], dtype=float),
             x_left=np.array([np.nan]),
@@ -1635,8 +1671,9 @@ def _bin_param(
 def marginal_1d(
     df: pd.DataFrame,
     param_col: str,
+    val_name: str,
     *,
-    objective: str = "value",
+    objective: str | None = None, # -> val_name if None
     binning: str = "quantile",
     bins: int = 10,
     min_count: int = 2,
@@ -1646,11 +1683,19 @@ def marginal_1d(
     minimize: bool = True,
     param_kind: str | None = None
 ) -> pd.DataFrame:
+    
+    # Validation
+    if not isinstance(val_name, str) or not val_name or val_name not in df.columns:
+        raise KeyError(f"Value column '{val_name}' not found in DataFrame or not a string.")
+    if objective is None:
+        objective = val_name
+    elif not isinstance(objective, str) or objective not in df.columns:
+        raise KeyError(f"Objective column '{objective}' not found in DataFrame or not a string.")
+
+    # Filter df
     param_col = _param_col(param_col)
     if param_col not in df.columns:
         raise KeyError(f"Parameter column '{param_col}' not found in DataFrame.")
-    if objective not in df.columns:
-        raise KeyError(f"Objective column '{objective}' not found in DataFrame.")
     d = df[(df["state"] == "COMPLETE") & df[objective].notna() & df[param_col].notna()].copy()
     if d.empty:
         return pd.DataFrame(columns=[
@@ -1660,6 +1705,7 @@ def marginal_1d(
 
     y = d[objective]
 
+    # Bin and return
     binfo = _bin_param(
         d, param_col,
         binning=binning,
@@ -1850,9 +1896,10 @@ def _compute_allowed_cols(
 
 def plot_marginals_1d(
     df: pd.DataFrame,
+    val_name: str,
     *,
-    objective: str = "value",
-    params: Iterable[str] | None = None,
+    objective: str = None, # -> val_name if None
+    params: list[str] | None = None,
     non_params_to_allow: Iterable[str] = [],
     ncols: int | None = None,              # auto: 1 if 1 param, 2 if 2, else 3
     panel_size: tuple[float, float] | None = None,
@@ -1866,6 +1913,14 @@ def plot_marginals_1d(
     param_kinds: dict[str, str] | None = None,
     title_prefix: str = "Marginal of ",
 ):
+    # Validation
+    if not isinstance(val_name, str) or not val_name or val_name not in df.columns:
+        raise KeyError(f"Value column '{val_name}' not found in DataFrame or not a string.")
+    if objective is None:
+        objective = val_name
+    elif not isinstance(objective, str) or objective not in df.columns:
+        raise KeyError(f"Objective column '{objective}' not found in DataFrame or not a string.")
+    
     # Ensure using full params names
     use_semilogx_cols = [_param_col(p) for p in use_semilogx]
 
@@ -1887,7 +1942,7 @@ def plot_marginals_1d(
 
         kind = (param_kinds or {}).get(pcol, _guess_param_kind(_get_param(df, pcol)))
         tbl = marginal_1d(
-            df, pcol, 
+            df, pcol, val_name,
             objective=objective,
             binning=(binning_numeric if kind == "numeric" else "unique"),
             bins=bins_numeric, min_count=min_count,
@@ -1898,9 +1953,9 @@ def plot_marginals_1d(
         semilog_this = (pcol in use_semilogx_cols) and (kind == "numeric")
         plot_marginal_1d_on_ax(
             ax, tbl,
-            title=f"{title_prefix}{pcol.replace('params_', '', 1).replace('user_attrs_', '', 1)}",
+            title=f"{title_prefix}{pcol.replace('params_', '', 1)}",
             xlabel="",
-            ylabel="value" if c == 0 else "",
+            ylabel=val_name if c == 0 else "",
             use_median=use_median,
             show_std=show_std,
             use_semilogx=semilog_this,
@@ -1914,7 +1969,7 @@ def plot_marginals_1d(
         axes[r, c].set_axis_off()
 
     if plotted:
-        fig.suptitle(f"Marginal Parameter Effects - obj: {objective}")
+        fig.suptitle("Marginal Parameter Effects")
         plt.show()
     else:
         plt.close(fig)
@@ -2011,10 +2066,11 @@ def display_marginal_1d(
 
 def display_marginals_1d(
     df: pd.DataFrame,
+    val_name: str,
     *,
-    params: Iterable[str] | None = None,
+    objective: str | None = None, # -> val_name if None
+    params: list[str] | None = None,
     non_params_to_allow: Iterable[str] = [],
-    objective: str = "value",
     bins_numeric: int = 8,
     top_k: int = 10,
     top_frac: float = 0.20,
@@ -2029,6 +2085,14 @@ def display_marginals_1d(
 
     If no params specified, all param columns in df are used.
     """
+    # Validation
+    if not isinstance(val_name, str) or not val_name or val_name not in df.columns:
+        raise KeyError(f"Value column '{val_name}' not found in DataFrame or not a string.")
+    if objective is None:
+        objective = val_name
+    elif not isinstance(objective, str) or objective not in df.columns:
+        raise KeyError(f"Objective column '{objective}' not found in DataFrame or not a string.")
+    
     # all allowed columns
     allowed = _compute_allowed_cols(df, params, non_params_to_allow)
     if not allowed:
@@ -2036,12 +2100,10 @@ def display_marginals_1d(
         return {}
 
     out = {}
-    if display_tbls:
-        _LOGGER.info(f"Displaying 1D marginals for objective: '{objective}'.")
     for pcol in allowed:
         kind = (param_kinds or {}).get(pcol, _guess_param_kind(df[pcol]))
         tbl = marginal_1d(
-            df, pcol, 
+            df, pcol, val_name,
             objective=objective,
             binning=("quantile" if kind == "numeric" else "unique"),
             bins=bins_numeric, min_count=2,
@@ -2111,8 +2173,9 @@ def marginal_2d(
     df: pd.DataFrame,
     param_a: str,
     param_b: str,
+    val_name: str,
     *,
-    objective: str = "value",
+    objective: str | None = None, # -> val_name if None
     binning: str = "quantile",   # "quantile" | "uniform" | "unique"
     bins_a: int = 5,
     bins_b: int = 5,
@@ -2122,8 +2185,13 @@ def marginal_2d(
     Returns dict with keys: 'median', 'mean', 'std', 'count'.
     Index: bins/levels of A. Columns: bins/levels of B.
     """
-    if objective not in df.columns:
-        raise KeyError(f"Objective column '{objective}' not found in DataFrame.")
+    # Validation
+    if not isinstance(val_name, str) or not val_name or val_name not in df.columns:
+        raise KeyError(f"Value column '{val_name}' not found in DataFrame or not a string.")
+    if objective is None:
+        objective = val_name
+    elif not isinstance(objective, str) or objective not in df.columns:
+        raise KeyError(f"Objective column '{objective}' not found in DataFrame or not a string.")
     
     # filter rows
     param_a = _param_col(param_a)
@@ -2182,6 +2250,7 @@ import plotly.graph_objects as go
 def plot_marginal_2d(
     pivots: dict[str, Any],
     statistic: str,
+    objective: str, # make sure it alignes with the one used in marginal_2d
     *,
     title: str,
     minimize: bool = True,
@@ -2299,7 +2368,7 @@ def plot_marginal_2d(
         x=x_centers, y=y_centers, z=Z,
         colorscale=colorscale,
         zmin=zmin, zmax=zmax,
-        colorbar=dict(title=colorbar_title or f"objective ({statistic})"),
+        colorbar=dict(title=colorbar_title or f"{objective} ({statistic})"),
         hovertemplate=hovertemplate,
         customdata=customdata,
         text=text,
@@ -2330,10 +2399,11 @@ from plotly.subplots import make_subplots
 
 def plot_marginals_2d(
     df: pd.DataFrame,
+    val_name: str,
     *,
+    objective: str | None = None,
     params: Iterable[str] | None = None,
     non_params_to_allow: Iterable[str] = [],
-    objective: str = "value",
     as_first: str | None = None,          # param to pin to first axis (if present)
     statistic: Literal["median", "mean", "std", "count"] = "median",
     title: str | None = None,
@@ -2358,6 +2428,14 @@ def plot_marginals_2d(
 
     Returns (figure, pivots_by_pair). Keys of pivots_by_pair are (param_a, param_b).
     """
+    # Validation
+    if not isinstance(val_name, str) or not val_name or val_name not in df.columns:
+        raise KeyError(f"Value column '{val_name}' not found in DataFrame or not a string.")
+    if objective is None:
+        objective = val_name
+    elif not isinstance(objective, str) or objective not in df.columns:
+        raise KeyError(f"Objective column '{objective}' not found in DataFrame or not a string.")
+    
     bins_b = bins_b if bins_b is not None else bins_a
 
     # all allowed columns
@@ -2381,8 +2459,8 @@ def plot_marginals_2d(
 
     if as_first:
         as_first = _param_col(as_first)
-        if as_first not in params:
-            _LOGGER.warning(f"as_first param '{as_first}' not found in params; ignoring pinning.")
+        if as_first not in allowed:
+            _LOGGER.warning(f"as_first param '{as_first}' not found in allowed params; ignoring pinning.")
             as_first = None
             ordered_pairs = all_pairs
         else:
@@ -2413,6 +2491,7 @@ def plot_marginals_2d(
             df,
             param_a=a,
             param_b=b,
+            val_name=val_name,
             objective=objective,
             binning=binning,
             bins_a=bins_a,
@@ -2453,6 +2532,7 @@ def plot_marginals_2d(
         subfig = plot_marginal_2d(  # your single-heatmap function
             pivots=piv,
             statistic=statistic,
+            objective=objective,
             title="",  # we'll use subplot_titles
             minimize=minimize,
             colorscale_minimize=colorscale_minimize,
@@ -2504,7 +2584,7 @@ def plot_marginals_2d(
         )
 
     # --- layout + spacing polish ---
-    main_title = title or f"Pairwise heatmaps - obj: {objective} - stat: {statistic}"
+    main_title = title or f"Pairwise heatmaps — {statistic}"
     fig.update_layout(
         title=dict(text=main_title),
         height=375*nrows,   
@@ -2549,7 +2629,7 @@ def _fmt_params(*, params: dict, max_param_items: int, sort_params: bool) -> str
 def plot_intermediate_values(
     study: optuna.study.Study,
     *,
-    target_name: str = "value",
+    val_name: str = "value",
     max_param_items: int = 30,
     sort_params: bool = True,
     include_params: Optional[Dict[str, Any]] = None,
@@ -2565,7 +2645,7 @@ def plot_intermediate_values(
     ----------
     study : optuna.study.Study
         The Optuna study to visualize.
-    target_name : str, default "value"
+    val_name : str, default "value"
         Label for target on the Y axis (also shown in hover).
     max_param_items : int, default 30
         Maximum number of params to display in tooltip (truncated if exceeded).
@@ -2646,7 +2726,7 @@ def plot_intermediate_values(
                 f"step: {step}",
             ]
             if val is not None and isinstance(val, (int, float)) and math.isfinite(val):
-                parts.append(f"{target_name}: {val:g}")
+                parts.append(f"{val_name}: {val:g}")
             parts.append(f"best_epoch: {trial.user_attrs.get('best_epoch', 'n/a')}")
             parts.append(f"duration: {_duration_fmt(td)}" if td else "duration: n/a")
             parts.append("--- params ---")
@@ -2658,13 +2738,16 @@ def plot_intermediate_values(
             trace.hoverinfo = "text"
             trace.hovertemplate = "%{hovertext}<extra></extra>"
 
-    return fig
+    html = fig.to_html(include_plotlyjs="inline", full_html=False)  # offline, self-contained
+    display(HTML(html))
+    return
+
 
 
 def plot_optimization_history(
     study: optuna.study.Study,
     *,
-    target=None,
+    target = None,
     target_name: str = "value",
     max_param_items: int = 30,
     sort_params: bool = True,
@@ -2722,7 +2805,7 @@ def plot_optimization_history(
                 parts.append(f"state: {t.state.name}") 
             
             if y is not None and (isinstance(y, (int, float)) and math.isfinite(y)):
-                parts.append(f"{target_name}: {y:g}") 
+                parts.append(f"{target_name}: {y:g}")
             
             if t is not None:
                 best_epoch = t.user_attrs.get("best_epoch", None)
@@ -2739,5 +2822,8 @@ def plot_optimization_history(
         tr.hovertext = texts
         tr.hoverinfo = "text"
         tr.hovertemplate = "%{hovertext}<extra></extra>"
+    
+    html = fig.to_html(include_plotlyjs="inline", full_html=False)  # offline, self-contained
+    display(HTML(html))
 
-    return fig
+    return 

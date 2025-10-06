@@ -155,6 +155,7 @@ class SARIMAXPipeline:
         self._sf = None
         self._start_train = None
         self._end_train = None
+        self.alias = None
 
         # internal attributes initialized during test
         self._start_test = None
@@ -585,6 +586,7 @@ class SARIMAXPipeline:
         alias: str = 'SARIMAX',
     ) -> None:
         """Fit the SARIMAX model."""
+        self.alias = alias
         
         # ------------ Generate train set ------------
         self._train_from_data(end_train, start_train=start_train)
@@ -845,15 +847,18 @@ class SARIMAXPipeline:
         fc_df = pd.DataFrame(fc_dict)
         
         # Add unique_id and ds columns
+        if not hasattr(self, 'alias'):
+            raise ValueError("Alias not set. Make sure to call .fit() before .forward().")
+        alias = self.alias
         fc_df['unique_id'] = self._unique_id
-        fc_df.rename(columns={'mean': 'SARIMAX'}, inplace=True)
+        fc_df.rename(columns={'mean': alias}, inplace=True)
         if levels:
             for L in levels:
                 lo, hi = f'lo-{L}', f'hi-{L}'
                 if lo in fc_df.columns:
-                    fc_df.rename(columns={lo: f'SARIMAX-lo-{L}'}, inplace=True)
+                    fc_df.rename(columns={lo: f'{alias}-lo-{L}'}, inplace=True)
                 if hi in fc_df.columns:
-                    fc_df.rename(columns={hi: f'SARIMAX-hi-{L}'}, inplace=True)
+                    fc_df.rename(columns={hi: f'{alias}-hi-{L}'}, inplace=True)
         fc_df['ds'] = output_df['ds'].reset_index(drop=True)
 
         forecasts = self._transform_target(fc_df, forward=False)
@@ -982,7 +987,15 @@ class SARIMAXPipeline:
                 pipeline = prev_pipeline
 
             # forecast
-            fc = pipeline.predict(h=h, levels=levels)
+            fc = pipeline.forward(
+                context_start=start_train,   # or None to start from prepared min
+                context_end=cutoff,
+                h=h,
+                levels=levels
+            )
+            # Sanity checks
+            assert fc['ds'].min() == cutoff + pd.Timedelta(hours=1)
+            assert fc['ds'].max() == cutoff + pd.Timedelta(hours=h)
 
             # build validation set for exactly h hours after cutoff
             mask = (
@@ -1150,7 +1163,7 @@ class SARIMAXPipeline:
     def forecast(self) -> pd.DataFrame:
         """Return the last computed forecast."""
         if self._forecast_df is None:
-            raise AttributeError("No forecast available; call `predict()` first.")
+            raise AttributeError("No forecast available; call `predict()` or `forward()` first.")
         return self._forecast_df
     
     @property
@@ -1208,7 +1221,9 @@ class SARIMAXPipeline:
         if forward:
             to_transform = ['y']
         else:
-            to_transform = [col for col in df.columns if 'SARIMAX' in col]
+            if not hasattr(self, 'alias'):
+                raise ValueError("Alias not set. Make sure to call .fit() before .predict()/.forward().")
+            to_transform = [col for col in df.columns if self.alias in col]
 
         # Apply the transformation
         for c in to_transform:
