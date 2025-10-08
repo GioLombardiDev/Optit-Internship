@@ -103,11 +103,16 @@ def configure_time_axes(
         formatter_major = mdates.DateFormatter('%d %b')
         locator_minor = mdates.DayLocator(interval=2)
         formatter_minor = None
-    elif period_days < 366:
+    elif period_days < 120:
         locator_major = mdates.MonthLocator()
         formatter_major = mdates.DateFormatter('%b\n%Y')
         locator_minor = mdates.WeekdayLocator(byweekday=mdates.MO)
         formatter_minor = mdates.DateFormatter('%d')
+    elif period_days < 366:
+        locator_major = mdates.MonthLocator()
+        formatter_major = mdates.DateFormatter('%b\n%Y')
+        locator_minor = mdates.WeekdayLocator(byweekday=mdates.MO, interval=2)
+        formatter_minor = None
     elif period_days < 366 * 2:
         locator_major = mdates.MonthLocator(interval=3)
         formatter_major = mdates.DateFormatter('%b\n%Y')
@@ -710,13 +715,13 @@ def plot_cutoff_results_with_exog(
 
     return fig
 
-def interactive_plot_cutoff_results_v0(
+def interactive_plot_cutoff_results(
     target_df: pd.DataFrame,
     cv_df: pd.DataFrame,
     *,
     aux_df: Optional[pd.DataFrame] = None,
     exog_vars: Optional[Sequence[str]] = None,
-    n_windows: int = 5,
+    n_windows: int = 1,
     models: Optional[Sequence[str]] = None,
     id: Optional[str] = None,
     add_context: bool = False,
@@ -725,6 +730,8 @@ def interactive_plot_cutoff_results_v0(
     order_of_models: Optional[Sequence[str]] = None,
     figsize: Optional[Tuple[int, int]] = None,
     only_aligned_to_day: bool = True,
+    use_slider: bool = True,
+    center_cutoff_index: int = 0,
 ):
     """
     Create an interactive slider to visualize rolling forecast windows
@@ -756,6 +763,12 @@ def interactive_plot_cutoff_results_v0(
         Order of models in the plot legend.
     figsize : Optional[Tuple[int, int]], default=None
         Size of the figure to create, in inches. If None, defaults to (12, 4 * (number of panels)).
+    only_aligned_to_day : bool, default=True
+        If True, only use cutoffs aligned to the end of a day (hour=23).
+    use_slider : bool, default=True
+        If True, display an interactive slider. If False, just render the initial plot (centered around center_cutoff_index).
+    center_cutoff_index : int, default=0
+        Index of the cutoff to center the window on when use_slider is False.
     
     Returns
     -------
@@ -765,7 +778,7 @@ def interactive_plot_cutoff_results_v0(
     from IPython.display import clear_output
 
     if only_aligned_to_day:
-        cv_df = cv_df[cv_df['cutoff'].dt.hour == 0].copy()
+        cv_df = cv_df[cv_df['cutoff'].dt.hour == 23].copy()
 
     cutoffs = sorted(cv_df['cutoff'].unique())
     if len(cutoffs) < n_windows:
@@ -811,6 +824,10 @@ def interactive_plot_cutoff_results_v0(
         
         return None
 
+    if use_slider is False:
+        # Just render the initial plot without interactivity
+        interactive_plot(center_cutoff_index)
+        return None
     # Hook up the slider
     widgets.interact(interactive_plot, center_cutoff_index=slider)
 
@@ -825,7 +842,7 @@ def plotly_forecasts_with_exog(
     cv_df: pd.DataFrame,
     aux_df=None,
     exog_vars=None,
-    n_windows: int = 5,
+    n_windows: int = 1,
     models=None,
     id=None,
     add_context: bool = False,

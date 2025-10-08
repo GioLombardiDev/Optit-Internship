@@ -4,6 +4,7 @@ import datetime
 import logging
 import warnings
 from typing import Optional, Dict, Any
+import re
 import math
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.addHandler(logging.NullHandler())
@@ -407,49 +408,29 @@ def display_info_cv(
 
 
 def get_cv_params_for_test(
-        unique_id: str,
         horizon_type: str,  # 'week' or 'day'
-        max_n_fits: int | None = None,
+        use_deprecated: bool = False, # If True, use the old CV plan 
         logger: Optional[logging.Logger] = None,
+        unique_id: Optional[str] = None, # 'F1', 'F2', 'F3', 'F4', 'F5', only needed if use_deprecated=True
         final: bool = False
     ) -> tuple[int, int, pd.Timestamp, int]:
     """
     Convenience wrapper that selects a pre-defined CV plan for a given series
     and horizon type, then calls :func:`get_cv_params_v2`.
 
-    It injects a preset ``n_windows`` and test-span (``start_test_cv``, ``end_test_cv``)
-    based on ``unique_id`` and ``horizon_type``, delegates to ``get_cv_params_v2``,
-    and returns its output.
-
-    Parameters
-    ----------
-    unique_id : str
-        Series identifier. Supported IDs: ``'F1'``, ``'F2'``, ``'F3'``, ``'F4'``, ``'F5'``.
-    horizon_type : str
-        Either ``'week'`` (``horizon_hours=168``) or ``'day'`` (``horizon_hours=24``).
-    max_n_fits : int or None, default None
-        Optional cap on total number of model fits (forwarded to ``get_cv_params_v2``).
-    logger : logging.Logger or None, default None
-        Logger to use for informational messages. Falls back to a module logger.
-    final : bool, default False
-        If True, use the settings for the final test phase; in this case,
-        max_n_fits is ignored. If False (default), use the settings for the initial test phase.
-
-    Returns
-    -------
-    dict
-        The dictionary returned by :func:`get_cv_params_v2` (keys: ``'step_size'``,
-        ``'test_hours'``, ``'end_test_actual'``, ``'n_windows'``, ``'refit'``,
-        ``'n_fits'``), with ``'n_windows'`` explicitly set to the preset value
-        for the chosen ``unique_id`` and ``horizon_type``.
     """
+    logger = logger or _LOGGER
+
     # Validate
-    if unique_id not in ['F1', 'F2', 'F3', 'F4', 'F5']:
-        raise ValueError(f"Unknown unique_id: {unique_id}. Known IDs are: F1, ..., F5")
+    if unique_id is not None:
+        if use_deprecated and unique_id not in ['F1', 'F2', 'F3', 'F4', 'F5']:
+            raise ValueError(f"Unknown unique_id: {unique_id}. Known IDs are: F1, ..., F5")
+        if not use_deprecated:
+            logger.warning("unique_id is ignored when use_deprecated=False")
     if horizon_type not in ['week', 'day']:
         raise ValueError(f"Unknown horizon_type: {horizon_type}. Known types are: 'week', 'day'.")
     
-    if not final:
+    if use_deprecated:
         for_get_cv_params = {
             'F1': {
                 'week': { # step_size = 9d
@@ -534,9 +515,155 @@ def get_cv_params_for_test(
             end_test_cv=params['end_test_cv'],
             n_windows=params.get('n_windows', None),
             step_size=params.get('step_size', None),
-            max_n_fits=params.get('max_n_fits', max_n_fits),
+            max_n_fits=params.get('max_n_fits', None),
             horizon_hours=168 if horizon_type == 'week' else 24,
             logger=logger
         )
     return out
+
+def sanity_cv_df(
+        cv_df: pd.DataFrame, 
+        metadata: dict, 
+        *,
+        positive_forecasts: bool = True,
+        logger: Optional[logging.Logger] = None
+    ) -> dict:
+    """
+    Validate that cv_df respects metadata['for_cv'] (except for 'refit' and 'n_fits') 
+    and that each timestamp (row) has a valid forecast value (non-NaN, finite, 
+    and > 0 if positive_forecasts=True).
+
+    Checks:
+      - required columns: {'unique_id','ds','y','cutoff'}
+      - 'ds' & 'cutoff' are datetime-like and non-null
+      - constant horizon h per cutoff; per-group ds = (cutoff+1h ... cutoff+h), hourly
+      - number of windows == for_cv['n_windows']
+      - cutoff spacing == for_cv['step_size'] hours
+      - coverage: ds.min == end_test - test_hours + 1h; ds.max == end_test
+      - last_cutoff + h == end_test
+      - main forecast column exists and is valid at every row
+    Returns a summary dict; raises AssertionError on failure.
+    """
+    errs = []
+
+    # ---- unpack for_cv ----
+    mcv = (metadata or {}).get("for_cv", {})
+    for key in ("step_size", "test_hours", "n_windows"):
+        if key not in mcv:
+            errs.append(f"metadata['for_cv'][{key!r}] is required.")
+    end_test_key = "end_test_cv" if "end_test_cv" in mcv else "end_test_actual"
+    if end_test_key not in mcv:
+        errs.append("metadata['for_cv'] must include 'end_test_cv' or 'end_test_actual'.")
+    if errs:
+        raise AssertionError("sanity_cv_test_df FAILED:\n- " + "\n- ".join(errs))
+
+    step_size   = int(mcv["step_size"])
+    test_hours  = int(mcv["test_hours"])
+    n_windows_exp = int(mcv["n_windows"])
+    end_test    = pd.Timestamp(mcv[end_test_key])
+
+    # ---- required columns ----
+    required = {"unique_id", "ds", "y", "cutoff"}
+    missing = required - set(cv_df.columns)
+    if missing:
+        errs.append(f"Missing required columns: {sorted(missing)}")
+
+    if errs:
+        raise AssertionError("sanity_cv_test_df FAILED:\n- " + "\n- ".join(errs))
+
+    # ---- dtypes & nulls ----
+    for c in ("ds", "cutoff"):
+        if not np.issubdtype(cv_df[c].dtype, np.datetime64):
+            errs.append(f"Column '{c}' must be datetime-like (got {cv_df[c].dtype}).")
+        if cv_df[c].isna().any():
+            errs.append(f"Column '{c}' contains NaT/NaNs.")
+
+    # ---- horizon per window & contiguity ----
+    h_counts = cv_df.groupby("cutoff", observed=True)["ds"].nunique()
+    if h_counts.empty:
+        errs.append("No cutoff groups found (is the DataFrame empty?).")
+        h = None
+    else:
+        if h_counts.nunique() != 1:
+            errs.append(f"Inconsistent horizon per cutoff: {sorted(h_counts.unique())}")
+        h = int(h_counts.iloc[0])
+
+    if h is not None:
+        # verify each group's ds is exactly (cutoff+1h ... cutoff+h) hourly
+        # sample up to 50 groups if very large
+        groups = h_counts.index
+        if len(groups) > 50:
+            groups = groups.sort_values()[::max(1, len(groups)//50)]
+        for c in groups:
+            ds_g = cv_df.loc[cv_df["cutoff"] == c, "ds"].sort_values()
+            expected = pd.date_range(c + pd.Timedelta(hours=1), periods=h, freq="h")
+            if not ds_g.reset_index(drop=True).equals(expected.to_series().reset_index(drop=True)):
+                errs.append(f"Non-contiguous hourly ds for cutoff {c}.")
+                break
+
+    # ---- number of windows & spacing ----
+    cutoffs = cv_df["cutoff"].drop_duplicates().sort_values()
+    if len(cutoffs) != n_windows_exp:
+        errs.append(f"n_windows mismatch: expected {n_windows_exp}, got {len(cutoffs)}")
+    if len(cutoffs) >= 2:
+        deltas_h = np.diff(cutoffs.values).astype("timedelta64[h]").astype(int)
+        if not np.all(deltas_h == step_size):
+            errs.append(f"Cutoff spacing must be {step_size}h; found {sorted(set(deltas_h))}h.")
+
+    # ---- coverage ----
+    ds_min, ds_max = cv_df["ds"].min(), cv_df["ds"].max()
+    exp_min = end_test - pd.Timedelta(hours=test_hours) + pd.Timedelta(hours=1)
+    if ds_max != end_test:
+        errs.append(f"Max ds != end_test ({ds_max} vs {end_test}).")
+    if ds_min != exp_min:
+        errs.append(f"Min ds != end_test - test_hours + 1h ({ds_min} vs {exp_min}).")
+
+    # last cutoff alignment
+    if (h is not None) and (len(cutoffs) > 0):
+        if cutoffs.iloc[-1] + pd.Timedelta(hours=h) != end_test:
+            errs.append(f"last_cutoff + h != end_test "
+                        f"({cutoffs.iloc[-1] + pd.Timedelta(hours=h)} vs {end_test}).")
+
+    # ---- find the main forecast column and validate values ----
+    # Heuristic: first numeric column that's not a core col and not an interval (lo/hi)
+    core = {"unique_id", "ds", "y", "cutoff"}
+    def _is_interval(col: str) -> bool:
+        return bool(re.search(r"(^lo-\d+$)|(^hi-\d+$)|(-lo-\d+$)|(-hi-\d+$)", col))
+
+    forecast_cols = [c for c in cv_df.columns
+                     if c not in core
+                     and pd.api.types.is_numeric_dtype(cv_df[c])
+                     and not _is_interval(c)]
+    if not forecast_cols:
+        errs.append("Could not locate a forecast column (e.g., model alias).")
+    else:
+        alias = forecast_cols[0]
+        vals = cv_df[alias].to_numpy()
+        if np.isnan(vals).any():
+            errs.append(f"Forecast column '{alias}' contains NaNs.")
+        if not np.isfinite(vals).all():
+            errs.append(f"Forecast column '{alias}' contains non-finite values.")
+        if positive_forecasts and not (vals > 0).all():
+            errs.append(f"Forecast column '{alias}' contains non-positive values, "
+                        f"but positive_forecasts=True.")
+
+    if errs:
+        raise AssertionError("sanity_cv_test_df FAILED:\n- " + "\n- ".join(errs))
+
+    logger = logger or _LOGGER
+    logger.info("✓ All sanity checks passed. CV DataFrame has the expected structure.")
+
+    # ---- summary for logs ----
+    return {
+        "alias": forecast_cols[0] if forecast_cols else None,
+        "n_rows": int(len(cv_df)),
+        "n_windows": int(len(cutoffs)),
+        "horizon_h": int(h),
+        "step_size_h": int(step_size),
+        "coverage": {"ds_min": str(ds_min), "ds_max": str(ds_max)},
+        "end_test": str(end_test),
+        "test_hours": int(test_hours),
+        "unique_ids": sorted(map(str, cv_df["unique_id"].unique())),
+        "positive_forecasts_enforced": bool(positive_forecasts),
+    }
 
