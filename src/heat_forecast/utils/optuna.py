@@ -16,7 +16,7 @@ import pandas as pd
 from pandas.api.types import is_numeric_dtype, is_integer_dtype, is_float_dtype, is_timedelta64_dtype, is_bool_dtype
 from pandas.io.formats.style import Styler
 
-from typing import Callable, Dict, Optional, Sequence, Any, Literal, Iterable
+from typing import Callable, Dict, List, Optional, Sequence, Any, Literal, Iterable, SupportsFloat, TypeVar, Mapping
 
 import warnings
 import logging
@@ -25,10 +25,7 @@ from dataclasses import dataclass, replace, asdict
 from IPython.display import display, HTML
 
 
-from ..pipeline.lstm import (
-    LSTMRunConfig, LSTMPipeline,
-    ModelConfig, DataConfig, FeatureConfig, TrainConfig, NormalizeConfig
-)
+from ..pipeline import lstm, tft
 
 # ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
 ## GENERAL OPTUNA UTILITIES
@@ -73,7 +70,12 @@ class SuggesterDoc:
 
 # ---- Registry ----
 
-SuggesterFn = Callable[[optuna.trial.Trial, "LSTMRunConfig"], "LSTMRunConfig"]
+RunConfig = TypeVar(
+    "RunConfig",
+    lstm.LSTMRunConfig,
+    tft.TFTRunConfig,
+)
+SuggesterFn = Callable[[optuna.trial.Trial, RunConfig], RunConfig]
 
 class _Entry:
     __slots__ = ("fn", "doc")
@@ -87,8 +89,8 @@ REGISTRY: Dict[str, _Entry] = globals().get("REGISTRY", {})
 def register_suggester(name: str, *, doc: Optional[SuggesterDoc] = None):
     """Decorator registering a suggester under a stable name, with optional docs."""
     def _decorator(fn: SuggesterFn) -> SuggesterFn:
-        if name in REGISTRY and REGISTRY[name].fn is not fn:
-            _LOGGER.warning("A suggester with name '%s' was already registered. Re-writing.", name)
+        # if name in REGISTRY and REGISTRY[name].fn is not fn:
+        #     _LOGGER.warning("A suggester with name '%s' was already registered. Re-writing.", name)
         REGISTRY[name] = _Entry(fn, doc)
         return fn  # no wrapping
     return _decorator
@@ -115,7 +117,6 @@ def get_registered_entry(name: str) -> _Entry:
     if entry is None:
         raise KeyError(f"Unknown suggester '{name}'. Known: {sorted(REGISTRY)}")
     return entry
-
 
 def get_suggester(name: str) -> SuggesterFn:
     entry = get_registered_entry(name)
@@ -212,13 +213,31 @@ def _duration_fmt(td: pd.Timedelta) -> str:
     h, m, s = total // 3600, (total % 3600) // 60, total % 60
     return f"{h:02}:{m:02}:{s:02}"
 
+FitFn = Callable[
+    [
+        optuna.trial.Trial,
+        pd.DataFrame,                    # target_df
+        Optional[pd.DataFrame],          # aux_df
+        RunConfig,                       # cfg (concrete type at runtime)
+        logging.Logger,                  # logger
+        Optional[pd.Timestamp], Optional[pd.Timestamp],  # start_train, end_train
+        Optional[pd.Timestamp], Optional[pd.Timestamp],  # start_val, end_val
+    ],
+    dict,  # out_optuna
+]
+FIT_FUNCS: Dict[type, FitFn] = {
+    lstm.LSTMRunConfig: lstm.fit_for_optuna_lstm,
+    tft.TFTRunConfig: tft.fit_for_optuna_tft,
+}
+
+
 def make_objective(
-    target_id_df: pd.DataFrame,
-    aux_id_df: pd.DataFrame | None,
-    base_config: LSTMRunConfig,
+    target_df: pd.DataFrame,
+    aux_df: pd.DataFrame | None,
+    base_config: RunConfig,
     *,
     objective_val: Literal["best", "avg_near_best", "last"] = "best",
-    suggest_config: Callable[[optuna.trial.Trial, LSTMRunConfig], LSTMRunConfig],
+    suggest_config: Callable[[optuna.trial.Trial, RunConfig], RunConfig],
     start_train: pd.Timestamp | None,
     end_train: pd.Timestamp | None,
     start_val: pd.Timestamp | None,
@@ -249,40 +268,29 @@ def make_objective(
         pipe = None
         train_loader = None
         val_loader = None
+        fit_for_optuna = FIT_FUNCS.get(type(cfg))
         try:
-            pipe = LSTMPipeline(
-                target_df=target_id_df,
-                aux_df=aux_id_df,
-                config=cfg,
+            out_optuna = fit_for_optuna(
+                trial=trial,
+                target_df=target_df,
+                aux_df=aux_df,
+                cfg=cfg,
                 logger=logger,
-            )
-
-            # loaders (computes global stats if needed)
-            train_loader, val_loader = pipe.make_loaders(
                 start_train=start_train, end_train=end_train,
                 start_val=start_val,     end_val=end_val,
             )
 
-            # train with pruning support (pipeline forwards `trial` to trainer)
-            out = pipe.fit(train_loader, val_loader=val_loader, trial=trial)
-            trial.set_user_attr("n_params", pipe.n_params) # save per-trial attribute
-            trainer = pipe._trainer
-
-            best_val = out.get('best_val_loss_orig')
-            trial.set_user_attr("best_val", float(best_val) if best_val is not None else None)
-
-            best_epoch = out.get('best_epoch')
-            trial.set_user_attr("best_epoch", int(best_epoch) if best_epoch is not None else None)
-
-            dur = out.get('duration_until_best')
-            trial.set_user_attr("dur_until_best", _duration_fmt(dur) if dur is not None else None)
-            trial.set_user_attr("dur_until_best_s", float(dur.total_seconds()) if dur is not None else None)
-
-            avg_near_best = out.get('avg_near_best')
-            trial.set_user_attr("avg_near_best", float(avg_near_best) if avg_near_best is not None else None)
-            
-            last_val = trainer.val_losses_orig[-1] if trainer.val_losses_orig else None
-            trial.set_user_attr("last_val", float(last_val) if last_val is not None else None)
+            trial.set_user_attr("n_params", out_optuna.get("n_params"))
+            best_val = out_optuna.get("best_val")
+            trial.set_user_attr("best_val", best_val)
+            trial.set_user_attr("best_epoch", out_optuna.get("best_epoch"))
+            dur_td = out_optuna.get('duration_until_best')
+            trial.set_user_attr("duration_until_best", _duration_fmt(dur_td) if dur_td is not None else None)
+            trial.set_user_attr("duration_until_best_s", out_optuna.get("duration_until_best_s"))
+            avg_near_best = out_optuna.get("avg_near_best")
+            trial.set_user_attr("avg_near_best", avg_near_best)
+            last_val = out_optuna.get("last_val")
+            trial.set_user_attr("last_val", last_val)
 
             if objective_val == "avg_near_best":
                 return float(avg_near_best) if avg_near_best is not None else float("inf")
@@ -527,11 +535,15 @@ class OptunaStudyConfig:
         }
         return structured
 
+CONFIG_MODEL_NAME: Dict[type, str] = {
+    lstm.LSTMRunConfig: "LSTM",
+    tft.TFTRunConfig: "TFT",
+}
 def run_study(
         unique_id: str,
         heat_df: pd.DataFrame, 
         aux_df: pd.DataFrame | None, 
-        base_cfg: LSTMRunConfig,
+        base_cfg: RunConfig,
         *,
         start_train: pd.Timestamp | None,
         end_train: pd.Timestamp | None,
@@ -581,6 +593,7 @@ def run_study(
         "cuda": torch.version.cuda if torch.version.cuda else None,
         "cudnn": torch.backends.cudnn.version()
     })
+    study.set_user_attr("model_name", CONFIG_MODEL_NAME.get(type(base_cfg), "unknown"))
 
     study.optimize(
         objective_fn,
@@ -592,6 +605,22 @@ def run_study(
     )
     return study
 
+def _validate_combos(combos: Iterable[Dict[str, Any]], suggest_config_name: str) -> None:
+    entry = get_registered_entry(suggest_config_name)
+    if entry.doc is None:
+        raise ValueError(f"Suggester '{suggest_config_name}' has no registered doc.")
+    # Make sure every param name exists
+    for combo in combos:
+        for k in combo:
+            if k not in {p.name for p in entry.doc.params}:
+                raise ValueError(f"Combo has unknown param '{k}'; suggester '{suggest_config_name}' knows {[p.name for p in entry.doc.params]}.")
+
+ConfigBuilder = Callable[Mapping[str, Any], RunConfig]
+CONFIG_BUILDERS: Dict[str, ConfigBuilder] = {
+    "LSTM": lstm.config_builder,
+    "TFT": tft.config_builder,
+}
+
 def continue_study(
         study_name: str,
         storage_url: str,
@@ -600,6 +629,9 @@ def continue_study(
         target_df: pd.DataFrame,
         aux_df: pd.DataFrame | None,
         suggest_config_name: str | None = None,
+        combos_to_enqueue: Iterable[Dict[str, Any]] | None = None,
+        trials_per_combo: int | None = None,
+
     ) -> optuna.Study:
     # retrieve and update pruner
     tmp = optuna.load_study(
@@ -613,6 +645,8 @@ def continue_study(
         suggest_config_name = tmp.user_attrs.get("suggest_config_name")
         if not suggest_config_name:
             raise KeyError("study missing 'suggest_config_name' user_attr")
+    if combos_to_enqueue is not None:
+        _validate_combos(combos_to_enqueue, suggest_config_name)
     suggest_config = get_suggester(suggest_config_name)
 
     # rebuild study with correct pruner and sampler
@@ -622,13 +656,36 @@ def continue_study(
     optuna_cfg = OptunaStudyConfig(**optuna_cfg_dict)
     pruner = optuna_cfg.make_pruner()
     sampler = optuna_cfg.make_sampler(suggester_name=suggest_config_name)
+    
+    # final study load
     study = optuna.load_study(
         study_name=study_name,
         storage=storage_url,
         pruner=pruner,
         sampler=sampler
     )
-    _LOGGER.info("Continuing study '%s' with %d new trials", study_name, n_new_trials)
+
+    # enqueue specific combos if requested 
+    if combos_to_enqueue is not None:
+        if trials_per_combo is None:
+            raise ValueError("If combos_to_enqueue is provided, trials_per_combo must also be provided.")
+        if not isinstance(trials_per_combo, int) or trials_per_combo < 1:
+            raise ValueError("trials_per_combo must be a positive integer.")
+        if n_new_trials < len(combos_to_enqueue) * trials_per_combo:
+            raise ValueError(f"n_new_trials={n_new_trials} is less than the number of combos to enqueue ({len(combos_to_enqueue)}x{trials_per_combo}={len(combos_to_enqueue)*trials_per_combo}).")
+        n_enqueued = 0
+        for combo in combos_to_enqueue:
+            for _ in range(trials_per_combo):
+                study.enqueue_trial(combo)
+                n_enqueued += 1
+
+    if combos_to_enqueue is None:
+        _LOGGER.info("Continuing study '%s' with %d new trials.", study_name, n_new_trials)
+    else:
+        _LOGGER.info(
+            "Continuing study '%s' with %d new trials; %d are enqueued (%dx%d).",
+            study_name, n_new_trials, n_enqueued, len(list(combos_to_enqueue)), trials_per_combo
+        )
 
     sd = optuna_cfg.to_structured_dict()
     lines = ", ".join(f"{k}={v}" for k, v in sd["General"].items())
@@ -642,14 +699,13 @@ def continue_study(
 
     # retrieve base config
     base_cfg_dict = study.user_attrs["base_cfg"]
-    base_cfg = LSTMRunConfig(
-        model=ModelConfig(**base_cfg_dict["model"]),
-        data=DataConfig(**base_cfg_dict["data"]),
-        features=FeatureConfig(**base_cfg_dict["features"]),
-        train=TrainConfig(**base_cfg_dict["train"]),
-        norm=NormalizeConfig(**base_cfg_dict["norm"]),
-        seed=base_cfg_dict["seed"]
-    )
+    model_name = tmp.user_attrs.get("model_name", "LSTM") 
+        # default to LSTM if attr is missing 
+        # (the studies for LSTM were created before using this attr)
+    config_builder = CONFIG_BUILDERS.get(model_name)
+    if config_builder is None:
+        raise ValueError(f"Unknown model_name '{model_name}' in study user_attrs; can't rebuild base config.")
+    base_cfg = config_builder(base_cfg_dict)
 
     # rebuild train sets
     unique_id = study.user_attrs["unique_id"]
@@ -880,122 +936,145 @@ def rename_study(
     # Return a loaded handle to the *new* study
     return optuna.load_study(study_name=new_name, storage=storage_url)
 
-def create_substudy_by_param(
+def clone_filtered_study(
     *,
-    storage_url: str,
-    src_study_name: str,
-    dst_study_name: str,
-    param_name: str,
-    equals: Optional[object] = None,
-    in_values: Optional[Iterable[object]] = None,
-    predicate: Optional[Callable[[object], bool]] = None,
-    numeric_tol: Optional[float] = None,
-    include_states: Optional[set[optuna.trial.TrialState]] = None,
-    copy_user_attrs: bool = True,
+    # Source (choose ONE): either pass src_study OR (storage_url + src_name)
+    src_study: Optional[optuna.Study] = None,
+    storage_url: Optional[str] = None,
+    src_name: Optional[str] = None,
+
+    # Destination controls
+    new_name: Optional[str] = None,
+    save_to_storage: bool = False,  # default: return in-memory study
+
+    # Filtering
+    predicate: Optional[Callable[[optuna.trial.FrozenTrial], bool]] = None,
+
+    # Misc
+    remember_original_numbers: bool = True,  # <- annotate cloned trials with original numbers
+    dry_run: bool = False,
+    logger: Optional[logging.Logger] = None,
 ) -> optuna.Study:
     """
-    Create a new Optuna study containing only the trials from `src_study_name`
-    that match a condition on parameter `param_name`.
+    Clone an Optuna study while filtering trials with `predicate`.
+    - Source can be a loaded Study (src_study) OR storage_url+src_name.
+    - By default, returns an IN-MEMORY study (not persisted).
+    - If save_to_storage=True, requires storage_url and new_name.
 
-    Matching options (first provided wins):
-      - equals: exact match (with numeric tolerance if numeric_tol given)
-      - in_values: membership in a set/list/tuple
-      - predicate: custom callable(value) -> bool
+    Skips RUNNING trials. Copies study-level user attrs.
+    Preserves single/multi-objective directions.
     """
-    # Load source study
-    src = optuna.load_study(study_name=src_study_name, storage=storage_url)
+    log = logger or logging.getLogger(__name__)
 
-    # Ensure destination doesn't exist
-    try:
-        optuna.load_study(study_name=dst_study_name, storage=storage_url)
-    except Exception:
-        pass
+    # --- Resolve source
+    if src_study is not None:
+        src = src_study
     else:
-        raise ValueError(f"Study '{dst_study_name}' already exists in this storage.")
+        if not (storage_url and src_name):
+            raise ValueError("Provide either src_study OR (storage_url and src_name).")
+        src = optuna.load_study(study_name=src_name, storage=storage_url)
 
-    # Decide directions (single or multi)
-    try:
-        directions = list(getattr(src, "directions"))
-    except Exception:
+    # --- Sanity checks
+    running = [t for t in src.get_trials(deepcopy=False)
+               if t.state == optuna.trial.TrialState.RUNNING]
+    if running:
+        log.warning("Found %d RUNNING trial(s); these will be skipped.", len(running))
+
+    # Directions (single or multi)
+    directions = getattr(src, "directions", None)
+    if not directions:
         directions = [src.direction]
 
-    # Create destination
-    if len(directions) == 1:
-        dst = optuna.create_study(
-            study_name=dst_study_name,
-            storage=storage_url,
-            direction=directions[0].name.lower(),  # "minimize"/"maximize"
-        )
+    # Eligible trials (skip RUNNING)
+    allowed_states = {
+        optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.PRUNED,
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.WAITING,
+    }
+    candidates = [t for t in src.get_trials(deepcopy=True) if t.state in allowed_states]
+
+    # Apply predicate safely
+    if predicate is not None:
+        def _passes(t: optuna.trial.FrozenTrial) -> bool:
+            try:
+                return bool(predicate(t))
+            except Exception as e:
+                log.debug("Predicate error on trial %s: %s; skipping.", t.number, e)
+                return False
+        trials = [t for t in candidates if _passes(t)]
     else:
-        dst = optuna.create_study(
-            study_name=dst_study_name,
-            storage=storage_url,
-            directions=[d.name.lower() for d in directions],
-        )
+        trials = candidates
 
-    # Build matcher
-    def _eq(a, b) -> bool:
-        if numeric_tol is not None and isinstance(a, numbers.Number) and isinstance(b, numbers.Number):
-            return abs(a - b) <= numeric_tol
-        return a == b
+    # Keep stable order (by original trial number)
+    trials.sort(key=lambda t: t.number)
 
-    if equals is not None:
-        match = lambda v: _eq(v, equals)
-        active_criteria = f"equals {equals!r}"
-    elif in_values is not None:
-        vals = set(in_values)
-        match = lambda v: any(_eq(v, x) for x in vals)
-        active_criteria = f"in {vals!r}"
-    elif predicate is not None:
-        match = predicate
-        active_criteria = "selected by predicate"
+    # --- DRY RUN
+    if dry_run:
+        dst_desc = "in-memory study" if not save_to_storage else f"'{new_name}' in storage"
+        log.info("[DRY RUN] Would clone -> %s; copy %d/%d trial(s); copy %d user_attr(s).",
+                 dst_desc, len(trials), len(candidates), len(src.user_attrs))
+        return src
+
+    # --- Create destination (in-memory by default)
+    if save_to_storage:
+        if not (storage_url and new_name):
+            raise ValueError("When save_to_storage=True, provide storage_url and new_name.")
+        # Ensure destination doesn't already exist
+        try:
+            _ = optuna.load_study(study_name=new_name, storage=storage_url)
+        except Exception:
+            pass
+        else:
+            raise ValueError(f"A study named '{new_name}' already exists in this storage.")
+
+        if len(directions) == 1:
+            dst = optuna.create_study(
+                study_name=new_name, storage=storage_url,
+                direction=directions[0].name.lower(),
+            )
+        else:
+            dst = optuna.create_study(
+                study_name=new_name, storage=storage_url,
+                directions=[d.name.lower() for d in directions],
+            )
     else:
-        raise ValueError("Provide one of: equals=, in_values=, or predicate= for filtering.")
+        # Pure in-memory
+        if len(directions) == 1:
+            dst = optuna.create_study(direction=directions[0].name.lower())
+        else:
+            dst = optuna.create_study(directions=[d.name.lower() for d in directions])
 
-    # States to include (exclude RUNNING by default)
-    if include_states is None:
-        include_states = {
-            optuna.trial.TrialState.COMPLETE,
-            optuna.trial.TrialState.PRUNED,
-            optuna.trial.TrialState.FAIL,
-            optuna.trial.TrialState.WAITING,
-        }
+    # --- Copy trials
+    if trials:
+        if remember_original_numbers:
+            # annotate each trial with provenance before adding
+            for t in trials:
+                # avoid mutating src object: user_attrs is copied in deepcopy already
+                t.user_attrs = dict(t.user_attrs)  # ensure it's our own dict
+                t.user_attrs.setdefault("orig_trial_number", t.number)
+                # keep study name if available
+                try:
+                    src_name_val = src.study_name  # may raise if not available
+                except Exception:
+                    src_name_val = None
+                if src_name_val is not None:
+                    t.user_attrs.setdefault("orig_study_name", src_name_val)
 
-    # Select and copy trials
-    allowed = []
-    for t in src.get_trials(deepcopy=True):
-        if t.state not in include_states:
-            continue
-        if param_name in t.params and match(t.params[param_name]):
-            allowed.append(t)
+        # add_trials preserves params/values/states/timings/attrs/intermediates
+        dst.add_trials(trials)
 
-    if allowed:
-        dst.add_trials(allowed)
+    # --- Copy study-level attrs
+    for k, v in src.user_attrs.items():
+        dst.set_user_attr(k, v)
 
-    # Copy study-level user attrs + provenance
-    if copy_user_attrs:
-        for k, v in src.user_attrs.items():
-            dst.set_user_attr(k, v)
-    dst.set_user_attr("_parent_study", src_study_name)
-    dst.set_user_attr("_substudy_filter", {
-        "param_name": param_name,
-        "equals": equals,
-        "in_values": list(in_values) if in_values is not None else None,
-        "numeric_tol": numeric_tol,
-        "states": [s.name for s in include_states],
-    })
-
-    txt = f"Constraint: {param_name} {active_criteria}"
-    _LOGGER.info(
-        "Created substudy '%s' from '%s' with %d matching trial(s). %s",
-        dst_study_name, src_study_name, len(allowed), txt
+    log.info(
+        "Cloned filtered study; copied %d/%d trial(s). Destination: %s",
+        len(dst.get_trials(deepcopy=False)), len(candidates),
+        (new_name if save_to_storage else "<in-memory>")
     )
 
-    if not allowed:
-        _LOGGER.warning("No trials matched %s in '%s'. Substudy created empty.", txt, src_study_name)
-
     return dst
-
 
 # ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
 ## FOR STUDY INSPECTION
@@ -1170,6 +1249,8 @@ def trials_df_for_display(
             "system_attrs_search_space",
             "datetime_start",
             "datetime_complete",
+            "user_attrs_orig_trial_number",
+            "user_attrs_orig_study_name",
         )
     df = df.drop(columns=[c for c in to_exclude if c in df.columns], errors="ignore")
 
@@ -1484,18 +1565,52 @@ def _interval_midpoints(index: pd.Index) -> np.ndarray:
         mids = (index.left.astype(float) + index.right.astype(float)) / 2.0
     return mids
 
+def _clamp_first_left_edge(intervals: pd.IntervalIndex, xn: pd.Series, *, floor_to_zero: bool = False) -> pd.IntervalIndex:
+    # finite-only min
+    xf = pd.to_numeric(xn, errors="coerce").astype(float)
+    xf = xf[np.isfinite(xf)]
+    if xf.empty:
+        return intervals  # nothing to clamp sensibly
+
+    lo = float(xf.min())
+    if floor_to_zero:
+        lo = max(0.0, lo)
+
+    L = intervals.left.astype(float).to_numpy()
+    R = intervals.right.astype(float).to_numpy()
+
+    # clamp first left edge to lo
+    L[0] = lo
+
+    # ensure the first interval is valid even if rounding produced R[0] < lo
+    if R[0] <= lo:
+        R[0] = lo
+
+    return pd.IntervalIndex.from_arrays(L, R, closed=intervals.closed)
+
 def _bin_param(
     d: pd.DataFrame,
     param_col: str,
     *,
-    binning: str = "quantile",   # "quantile" | "uniform" | "unique"
+    binning: str = "quantile",                               # "quantile" | "uniform" | "unique" | "custom"
     bins: int = 10,
-    param_kind: str | None = None  # 'categorical' or 'numeric' (override dtype)
+    param_kind: str | None = None,                           # 'categorical' or 'numeric' (override dtype)
+    custom_edges: Optional[Sequence[SupportsFloat]] = None,          # interior cut points, by value
+    custom_quantiles: Optional[Sequence[float]] = None,      # interior cut points, by quantile in (0,1)
 ) -> Binned:
     x = _get_param(d, param_col)
 
+    # Validate inputs
+    if binning not in ("quantile", "uniform", "unique", "custom"):
+        raise ValueError(f"Error while binning {param_col}: binning must be one of: 'quantile', 'uniform', 'unique', 'custom'")
+    if binning == "custom" and (custom_edges is None and custom_quantiles is None):
+        raise ValueError(f"Error while binning {param_col}: for binning='custom', provide custom_edges or custom_quantiles.")
+    if binning == "custom" and (custom_edges is not None and custom_quantiles is not None):
+        raise ValueError(f"Error while binning {param_col}: for binning='custom', provide only one of custom_edges or custom_quantiles.")
+    if binning != "custom" and (custom_edges is not None or custom_quantiles is not None):
+        _LOGGER.warning(f"Error while binning {param_col}: ignoring custom_edges/custom_quantiles since binning != 'custom'.")
     if param_kind not in (None, "categorical", "numeric"):
-        raise ValueError("param_kind must be one of: None, 'categorical', 'numeric'")
+        raise ValueError(f"Error while binning {param_col}: param_kind must be one of: None, 'categorical', 'numeric'")
     
     # Decide treatment 
     if param_kind == "categorical":
@@ -1503,7 +1618,7 @@ def _bin_param(
     elif param_kind == "numeric":
         treat_as_categorical = False
     else: # param_kind is None
-        treat_as_categorical = (not is_numeric_dtype(x)) or is_bool_dtype(x)
+        treat_as_categorical = (not is_numeric_dtype(x)) or is_bool_dtype(x) or (x.nunique() <= bins)
 
     # --------- Categorical treatment ----------
     if treat_as_categorical:
@@ -1568,10 +1683,13 @@ def _bin_param(
 
     # --------- Numeric treatment ----------
     xn = pd.to_numeric(x, errors="coerce")
-    n_unique = xn.dropna().nunique()
+    if np.isinf(xn).any():
+        raise ValueError(f"Error while binning {param_col}: non-finite values found.")
+    xn_finite = xn
+    n_unique = xn_finite.dropna().nunique()
 
     if n_unique <= 1:
-        single_center = float(xn.median())
+        single_center = float(xn_finite.median())
         degenerate_info = {
             "level": ["all"],
             "x_center": np.array([single_center], dtype=float),
@@ -1591,48 +1709,112 @@ def _bin_param(
             degenerate=True,
             degenerate_info=degenerate_info,
         )
+    
+    # Custom quantiles to numeric edges
+    if binning == "custom" and custom_quantiles is not None:
+        try:
+            qs = np.asarray(list(custom_quantiles), dtype=float)
+        except Exception as e:
+            raise ValueError(f"Error while binning {param_col}: custom_quantiles must be a sequence of floats.") from e
+        if qs.ndim != 1 or qs.size == 0:
+            raise ValueError(f"Error while binning {param_col}: custom_quantiles must be a non-empty 1D sequence.")
+        if np.any(~np.isfinite(qs)) or np.any((qs <= 0.0) | (qs >= 1.0)):
+            raise ValueError(f"Error while binning {param_col}: custom_quantiles must be finite and in the open interval (0, 1).")
+        qs = np.unique(qs)
+        if xn_finite.empty:
+            raise ValueError(f"Error while binning {param_col}: all values are NaN/inf; cannot compute quantiles.")
+        q_vals = xn_finite.quantile(qs, interpolation="linear").to_numpy(dtype=float)
+        custom_edges = q_vals  # fall-through to the custom_edges path
+
+    # Custom numeric edges
+    if binning == "custom" and custom_edges is not None:
+        # accept ints, floats, numpy scalars → coerce by trying float conversion
+        try:
+            edges = np.asarray(list(custom_edges), dtype=float)
+        except Exception as e:
+            raise ValueError(f"Error while binning {param_col}: custom_edges must be a sequence of numeric values.") from e
+        if edges.ndim != 1 or edges.size == 0:
+            raise ValueError(f"Error while binning {param_col}: custom_edges must be a non-empty 1D sequence.")
+
+        # dedupe + sort
+        edges = np.unique(edges)
+
+        # establish observed finite range
+        if xn_finite.empty:
+            raise ValueError(f"Error while binning {param_col}: all values are NaN/inf; cannot build custom bins.")
+        lo = float(xn_finite.min())
+        hi = float(xn_finite.max())
+        if not (hi > lo):
+            # degenerate case will be handled below, but guard anyway
+            hi = lo
+
+        # keep only strict interior edges
+        edges = edges[(edges > lo) & (edges < hi)]
+        breaks = np.concatenate(([lo], edges, [hi]))
+
+        # build intervals, clamp first-left edge
+        intervals = pd.IntervalIndex.from_breaks(breaks, closed="right")
+        b = pd.cut(xn, bins=intervals, include_lowest=True)
+        b = b.cat.set_categories(intervals, ordered=True)
+
+        intervals = b.cat.categories
+        intervals = _clamp_first_left_edge(intervals, xn, floor_to_zero=True)
+
+        centers = _interval_midpoints(intervals)
+        x_left = intervals.left.astype(float)
+        x_right = intervals.right.astype(float)
+        _fmtL = _best_num_formatter_for_series(x_left)
+        _fmtR = _best_num_formatter_for_series(x_right)
+        level = [f"[{_fmtL(x_left[0])}, {_fmtR(x_right[0])}]"] \
+            + [f"({_fmtL(L)}, {_fmtR(R)}]" for L, R in zip(x_left[1:], x_right[1:])]
+
+        return Binned(
+            bins=b, level=level, x_center=centers, x_left=x_left, x_right=x_right,
+            effective="custom", treat_as_categorical=False, degenerate=False, degenerate_info=None,
+        )
 
     # Choose effective binning
     effective = "unique" if (binning == "quantile" and bins >= n_unique) else binning
 
     if effective == "quantile":
-        # Quantile bins via qcut, and make sure it's ordered
-        b = pd.qcut(xn, q=min(bins, n_unique), duplicates="drop")
+        # Build edges from finite data, then apply to full series
+        q = int(min(bins, max(1, n_unique))) 
+        b = pd.qcut(xn_finite, q=q, duplicates="drop")
         b = b.cat.set_categories(b.cat.categories, ordered=True)
 
         intervals = b.cat.categories  # IntervalIndex
+        intervals = _clamp_first_left_edge(intervals, xn, floor_to_zero=True)  # set False if negatives are allowed
+
         centers = _interval_midpoints(intervals)
         x_left = intervals.left.astype(float)
         x_right = intervals.right.astype(float)
         _fmtL = _best_num_formatter_for_series(x_left)
         _fmtR = _best_num_formatter_for_series(x_right)
-        level = [f"({_fmtL(L)}, {_fmtR(R)}]" for L, R in zip(x_left, x_right)]
+        level = [f"[{_fmtL(x_left[0])}, {_fmtR(x_right[0])}]"] \
+            + [f"({_fmtL(L)}, {_fmtR(R)}]" for L, R in zip(x_left[1:], x_right[1:])]
 
         return Binned(
-            bins=b,
-            level=level,
-            x_center=centers,
-            x_left=x_left,
-            x_right=x_right,
-            effective="quantile",
-            treat_as_categorical=False,
-            degenerate=False,
-            degenerate_info=None,
+            bins=b, level=level, x_center=centers, x_left=x_left, x_right=x_right,
+            effective="quantile", treat_as_categorical=False, degenerate=False, degenerate_info=None,
         )
 
     elif effective == "uniform":
         # Same heuristic cap + uniform bins via cut
         nb = min(bins, max(2, int(np.sqrt(n_unique))))
-        b = pd.cut(xn, bins=nb)
+        b = pd.cut(xn, bins=nb, include_lowest=True)
         b = b.cat.set_categories(b.cat.categories, ordered=True)
 
         intervals = b.cat.categories  # IntervalIndex
+        intervals = _clamp_first_left_edge(intervals, xn, floor_to_zero=True)  # set False if negatives are allowed
+
         centers = _interval_midpoints(intervals)
         x_left = intervals.left.astype(float)
         x_right = intervals.right.astype(float)
         _fmtL = _best_num_formatter_for_series(x_left)
         _fmtR = _best_num_formatter_for_series(x_right)
-        level = [f"({_fmtL(L)}, {_fmtR(R)}]" for L, R in zip(x_left, x_right)]
+        level = [f"[{_fmtL(x_left[0])}, {_fmtR(x_right[0])}]"] \
+            + [f"({_fmtL(L)}, {_fmtR(R)}]" for L, R in zip(x_left[1:], x_right[1:])]
+
         return Binned(
             bins=b,
             level=level,
@@ -1645,27 +1827,20 @@ def _bin_param(
             degenerate_info=None,
         )
 
+
     else:  # "unique"
-        # One bin per unique numeric value; keep numeric order in the index
-        idx = pd.Index(xn.dropna().unique()).astype(float).sort_values()
+        idx = pd.Index(xn_finite.dropna().unique()).astype(float).sort_values()
         bins_c = pd.Categorical(xn, categories=idx, ordered=True)
 
-        # Geometry for plotting: centers = the value; no edges
         x_center = idx.to_numpy(dtype=float)
         x_left = np.full(len(idx), np.nan)
         x_right = np.full(len(idx), np.nan)
-        _fmt = _best_num_formatter_for_series(xn)
+        _fmt = _best_num_formatter_for_series(xn_finite)
         level = [_fmt(v) for v in idx]
+
         return Binned(
-            bins=bins_c,
-            level=level,
-            x_center=x_center,
-            x_left=x_left,
-            x_right=x_right,
-            effective="unique",
-            treat_as_categorical=False,
-            degenerate=False,
-            degenerate_info=None,
+            bins=bins_c, level=level, x_center=x_center, x_left=x_left, x_right=x_right,
+            effective="unique", treat_as_categorical=False, degenerate=False, degenerate_info=None,
         )
 
 def marginal_1d(
@@ -1681,7 +1856,9 @@ def marginal_1d(
     top_k: int = 10,
     top_frac: float = 0.20,
     minimize: bool = True,
-    param_kind: str | None = None
+    param_kind: str | None = None,
+    custom_edges: Optional[Sequence[SupportsFloat]] = None,          
+    custom_quantiles: Optional[Sequence[float]] = None,
 ) -> pd.DataFrame:
     
     # Validation
@@ -1710,7 +1887,9 @@ def marginal_1d(
         d, param_col,
         binning=binning,
         bins=bins,
-        param_kind=param_kind
+        param_kind=param_kind,
+        custom_edges=custom_edges,
+        custom_quantiles=custom_quantiles,
     )
 
     if binfo.degenerate:
@@ -1761,12 +1940,14 @@ def marginal_1d(
     if compute_shares:
         d_sorted = d.sort_values(objective, ascending=minimize)
 
+        k = max(1, min(top_k, len(d_sorted)))
         if "number" in d_sorted.columns:
-            k = max(1, min(top_k, len(d_sorted)))
             best_ids = set(d_sorted.head(k)["number"])
             d["__is_topK"] = d["number"].isin(best_ids).astype(float)
         else:
-            d["__is_topK"] = np.nan
+            # fall back to rank-by-index if you want exact K even without an id
+            d["__is_topK"] = 0.0
+            d.loc[d_sorted.index[:k], "__is_topK"] = 1.0
 
         frac = max(1e-6, min(1.0, float(top_frac)))
         k_cut = max(1, int(np.ceil(frac * len(d_sorted))))
@@ -1775,12 +1956,26 @@ def marginal_1d(
             (d[objective] <= cutoff) if minimize else (d[objective] >= cutoff)
         ).astype(float)
 
-        shares = d.groupby("__bin__", observed=False)[["__is_topK", "__is_topFrac"]].mean()
-        out["share_topK"] = shares["__is_topK"].to_numpy()
-        out["share_topFrac"] = shares["__is_topFrac"].to_numpy()
+        # --- Aggregate per bin ---
+        bin_index = d["__bin__"].cat.categories
+        grp = d.groupby("__bin__", observed=False)
+
+        bin_count = grp.size().reindex(bin_index, fill_value=0)
+        top_sums = grp[["__is_topK", "__is_topFrac"]].sum().reindex(bin_index, fill_value=0.0)
+
+        # Prevalence (what you already expose)
+        out["share_topK"]   = (top_sums["__is_topK"]   / bin_count.replace(0, np.nan)).to_numpy()
+        out["share_topFrac"]= (top_sums["__is_topFrac"]/ bin_count.replace(0, np.nan)).to_numpy()
+
+        # --- Composition: how the *global* top is composed by bins ---
+        total_topK   = float(d["__is_topK"].sum())
+        total_topFrac= float(d["__is_topFrac"].sum())
+
+        out["contrib_topK"]    = (top_sums["__is_topK"]   / (total_topK   if total_topK   > 0 else np.nan)).to_numpy()
+        out["contrib_topFrac"] = (top_sums["__is_topFrac"]/ (total_topFrac if total_topFrac> 0 else np.nan)).to_numpy()
     else:
-        out["share_topK"] = np.nan
-        out["share_topFrac"] = np.nan
+        out["share_topK"] = out["share_topFrac"] = np.nan
+        out["contrib_topK"] = out["contrib_topFrac"] = np.nan
 
     out.loc[out["count"] < int(min_count), ["mean","median","std","p25","p75","share_topK","share_topFrac"]] = np.nan
     out = out.sort_values("x_center", kind="mergesort").reset_index(drop=True)
@@ -1905,6 +2100,8 @@ def plot_marginals_1d(
     panel_size: tuple[float, float] | None = None,
     # marginal/plot settings
     binning_numeric: str = "quantile",
+    custom_edges: Optional[Sequence[SupportsFloat]] = None,
+    custom_quantiles: Optional[Sequence[float]] = None,
     bins_numeric: int = 8,
     min_count: int = 2,
     use_median: bool = True,
@@ -1912,6 +2109,7 @@ def plot_marginals_1d(
     use_semilogx: list[str] = ["train.learning_rate"],
     param_kinds: dict[str, str] | None = None,
     title_prefix: str = "Marginal of ",
+
 ):
     # Validation
     if not isinstance(val_name, str) or not val_name or val_name not in df.columns:
@@ -1945,6 +2143,8 @@ def plot_marginals_1d(
             df, pcol, val_name,
             objective=objective,
             binning=(binning_numeric if kind == "numeric" else "unique"),
+            custom_edges=custom_edges,
+            custom_quantiles=custom_quantiles,
             bins=bins_numeric, min_count=min_count,
             compute_shares=False, minimize=True,
             param_kind=kind
@@ -2009,7 +2209,7 @@ def display_marginal_1d(
 
     # shares
     if include_shares:
-        for c in ("share_topK","share_topFrac"):
+        for c in ("share_topK","share_topFrac", "contrib_topK","contrib_topFrac"):
             if _has(c): cols.append(c)
 
     # ensure existence & filter
@@ -2027,8 +2227,11 @@ def display_marginal_1d(
         "std": "Std",
         "share_topK": "Top-K share",
         "share_topFrac": "Top-Frac share",
+        "contrib_topK": "Top-K composition",
+        "contrib_topFrac": "Top-Frac composition",
     }
     df = df.rename(columns=rename_map)
+    print(df.columns)
 
     # formatting
     fmt_map = {}
@@ -2037,13 +2240,17 @@ def display_marginal_1d(
             continue
         if c in ("Count",):
             fmt_map[c] = "{:,.0f}".format
-        elif c in ("Top-K share","Top-Frac share"):
+        elif c in ("Top-K composition","Top-Frac composition"):
             fmt_map[c] = _pct_fmt
         else:
             fmt_map[c] = _float_fmt
 
     # color gradients
-    styler = df.style.hide(axis="index")
+    styler = (
+        df.style
+        .hide(axis="index")
+        .format(fmt_map, na_rep="—") 
+    )
     # green on chosen stat
     to_prettify = [rename_map[s] for s in ("median", "mean", "p25", "p75") if s in cols]
     if to_prettify:
@@ -2051,7 +2258,7 @@ def display_marginal_1d(
             subset=to_prettify,
             cmap=("Greens_r" if minimize else "Greens")
         )
-    to_prettify_shares = [rename_map[s] for s in ("share_topK","share_topFrac") if s in cols]
+    to_prettify_shares = [rename_map[s] for s in ("share_topK","share_topFrac","contrib_topK","contrib_topFrac") if s in cols]
     if to_prettify_shares:
         styler = styler.background_gradient(
             subset=to_prettify_shares,
@@ -2071,6 +2278,9 @@ def display_marginals_1d(
     objective: str | None = None, # -> val_name if None
     params: list[str] | None = None,
     non_params_to_allow: Iterable[str] = [],
+    binning_numeric: str = "quantile",
+    custom_edges_dict: Dict[str, Optional[Sequence[SupportsFloat]]] = {},
+    custom_quantiles_dict: Dict[str, Optional[Sequence[float]]] = {},
     bins_numeric: int = 8,
     top_k: int = 10,
     top_frac: float = 0.20,
@@ -2093,6 +2303,10 @@ def display_marginals_1d(
     elif not isinstance(objective, str) or objective not in df.columns:
         raise KeyError(f"Objective column '{objective}' not found in DataFrame or not a string.")
     
+    non_params_to_allow = tuple(non_params_to_allow or ())
+    custom_edges_dict = custom_edges_dict or {}
+    custom_quantiles_dict = custom_quantiles_dict or {}
+    
     # all allowed columns
     allowed = _compute_allowed_cols(df, params, non_params_to_allow)
     if not allowed:
@@ -2102,15 +2316,27 @@ def display_marginals_1d(
     out = {}
     for pcol in allowed:
         kind = (param_kinds or {}).get(pcol, _guess_param_kind(df[pcol]))
+        pname = pcol.replace("params_", "")
+
+        # fetch custom specs without using `or` (so [] isn't treated as missing)
+        custom_edges = custom_edges_dict[pcol] if pcol in custom_edges_dict else custom_edges_dict.get(pname)
+        custom_quants = custom_quantiles_dict[pcol] if pcol in custom_quantiles_dict else custom_quantiles_dict.get(pname)
+
+        # decide binning for this column only
+        use_custom = (custom_edges is not None) or (custom_quants is not None)
+        binning_for_this = ("custom" if use_custom else (binning_numeric if kind == "numeric" else "unique"))
+
         tbl = marginal_1d(
             df, pcol, val_name,
             objective=objective,
-            binning=("quantile" if kind == "numeric" else "unique"),
+            binning=binning_for_this,
             bins=bins_numeric, min_count=2,
             compute_shares=True, 
             top_k=top_k, top_frac=top_frac,
             minimize=minimize,
-            param_kind=kind
+            param_kind=kind,
+            custom_edges=custom_edges,
+            custom_quantiles=custom_quants,
         )
         sty = display_marginal_1d(
             tbl, minimize=minimize,
@@ -2169,6 +2395,41 @@ def plot_param_importances(
 # Two-parameter interaction views
 # ---------------------------
 
+def _assign_left_edge_nans_to_first_bin(
+    d: pd.DataFrame,
+    *,
+    value_col: str,    # the raw numeric series we binned (e.g., param_a)
+    bin_col: str,      # the categorical bins column (e.g., "__A__")
+) -> None:
+    """
+    If any rows have NaN in `bin_col` but the underlying value is <= first bin's right edge,
+    force-assign them to the first bin. Works for IntervalIndex bins only. In-place on `d`.
+    """
+    b = d[bin_col]
+    if not isinstance(getattr(b, "dtype", None), pd.CategoricalDtype):
+        return  # nothing to do
+
+    cats = b.cat.categories
+    if not isinstance(cats, pd.IntervalIndex) or len(cats) == 0:
+        return  # only meaningful for interval bins
+
+    first = cats[0]
+    # numeric values (coerce and ignore non-finite)
+    x = pd.to_numeric(d[value_col], errors="coerce").astype(float)
+
+    # robust "≤ first.right" with a tiny tolerance
+    # nextafter handles exact-endpoint and floating rounding
+    right_edge = float(np.nextafter(float(first.right), np.inf))
+
+    # mask: currently NaN bin AND value ≤ first.right
+    mask = b.isna() & x.le(right_edge)
+
+    if mask.any():
+        b = b.copy()                  # make it writeable
+        b.loc[mask] = first           # assign the first category
+        d[bin_col] = b                # write back
+
+
 def marginal_2d(
     df: pd.DataFrame,
     param_a: str,
@@ -2179,6 +2440,10 @@ def marginal_2d(
     binning: str = "quantile",   # "quantile" | "uniform" | "unique"
     bins_a: int = 5,
     bins_b: int = 5,
+    custom_edges_a: Optional[Sequence[SupportsFloat]] = None,
+    custom_quantiles_a: Optional[Sequence[float]] = None,
+    custom_edges_b: Optional[Sequence[SupportsFloat]] = None,
+    custom_quantiles_b: Optional[Sequence[float]] = None,
 ) -> dict[str, pd.DataFrame]:
     """
     Build pivot tables of objective statistics for interactions between two params.
@@ -2192,7 +2457,9 @@ def marginal_2d(
         objective = val_name
     elif not isinstance(objective, str) or objective not in df.columns:
         raise KeyError(f"Objective column '{objective}' not found in DataFrame or not a string.")
-    
+    if not binning in ("quantile", "uniform", "unique"):
+        raise ValueError(f"Invalid binning method '{binning}'; must be one of 'quantile', 'uniform', or 'unique'.")
+
     # filter rows
     param_a = _param_col(param_a)
     param_b = _param_col(param_b)
@@ -2207,11 +2474,23 @@ def marginal_2d(
         return empty
 
     # bin both params (ordered categoricals)
-    binfo_a = _bin_param(d, param_a, binning=binning, bins=bins_a)
-    binfo_b = _bin_param(d, param_b, binning=binning, bins=bins_b)
+    if custom_edges_a is not None or custom_quantiles_a is not None:
+        binning_a = "custom"
+    else:
+        binning_a = binning
+    if custom_edges_b is not None or custom_quantiles_b is not None:
+        binning_b = "custom"
+    else:
+        binning_b = binning
+    binfo_a = _bin_param(d, param_a, binning=binning_a, bins=bins_a,
+                         custom_edges=custom_edges_a, custom_quantiles=custom_quantiles_a)
+    binfo_b = _bin_param(d, param_b, binning=binning_b, bins=bins_b,
+                         custom_edges=custom_edges_b, custom_quantiles=custom_quantiles_b)
 
     d["__A__"] = binfo_a.bins
     d["__B__"] = binfo_b.bins
+    _assign_left_edge_nans_to_first_bin(d, value_col=param_a, bin_col="__A__")
+    _assign_left_edge_nans_to_first_bin(d, value_col=param_b, bin_col="__B__")
 
     # observed=False -> include empty categories (full A×B grid)
     grp = d.groupby(["__A__", "__B__"], dropna=False, observed=False)
@@ -2245,6 +2524,61 @@ def marginal_2d(
         "binfo": (binfo_a, binfo_b),
     }
 
+def _format_intervals_like_user_wants(index_like) -> list[str]:
+    """
+    If index_like is an IntervalIndex, return strings like "(L, R]” using:
+      _fmtL = _best_num_formatter_for_series(x_left)
+      _fmtR = _best_num_formatter_for_series(x_right)
+    Else, return str(label) for each entry.
+    """
+    if isinstance(index_like, pd.IntervalIndex):
+        x_left = index_like.left.to_numpy()
+        x_right = index_like.right.to_numpy()
+        _fmtL = _best_num_formatter_for_series(x_left)
+        _fmtR = _best_num_formatter_for_series(x_right)
+        return [f"({_fmtL(L)}, {_fmtR(R)}]" for L, R in zip(x_left, x_right)]
+    else:
+        return [str(v) for v in index_like]
+
+import re
+
+# Match interval-like strings: "(a, b]", "[a,b)", etc. (flexible whitespace & number formats)
+_INTERVAL_RE = re.compile(
+    r"""^\s*[\(\[]\s*         # opening bracket
+        [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*,\s*  # left number
+        [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*      # right number
+        [\)\]]\s*$         # closing bracket
+    """,
+    re.VERBOSE,
+)
+
+def _infer_center_labels_from_levels(
+    levels: Sequence[str],
+    centers: Sequence[float],
+) -> List[str]:
+    """
+    If *all* `levels` look like interval strings (e.g., "(a, b]", "[a, b)"),
+    return the numeric `centers` sequence converted to strings. Otherwise return the original `levels`.
+
+    Returns:
+        list[float] if interval-like; else list[str].
+    """
+    # Fast exit for empty input
+    if not levels:
+        return list(levels)  # empty list
+
+    # Check if every level matches the interval pattern
+    all_interval = True
+    for s in levels:
+        if not isinstance(s, str) or _INTERVAL_RE.match(s) is None:
+            all_interval = False
+            break
+    if all_interval:
+        _fmt = _best_num_formatter_for_series(np.array(centers))
+        return [_fmt(v) for v in centers]
+
+    return list(levels)
+
 import plotly.graph_objects as go
 
 def plot_marginal_2d(
@@ -2259,6 +2593,8 @@ def plot_marginal_2d(
     colorbar_title: str | None = None,
     show_text: bool = False,
     text_fmt: str = ".3g",
+    hover_stats: Sequence[str] | None = None,
+    hover_value_fmt: str = ".4g",
 ) -> go.Figure:
     """
     Simple Plotly heatmap for a two_param_summary pivot.
@@ -2284,7 +2620,7 @@ def plot_marginal_2d(
     pname_a = pivot.index.name if pivot.index.name else "param A"
     pname_b = pivot.columns.name if pivot.columns.name else "param B"
 
-    # centers: prefer from binfo (binfo_a = rows, binfo_b = cols), else positional
+    # centers: prefer from binfo (binfo_a = rows, binfo_b = cols), else from IntervalIndex, else positional
     binfo = pivots.get("binfo")
 
     def _safe_centers(b) -> np.ndarray | None:
@@ -2296,7 +2632,6 @@ def plot_marginal_2d(
         return arr
 
     x_centers = y_centers = None
-    centers_from_binfo_x = centers_from_binfo_y = False
 
     if isinstance(binfo, tuple) and len(binfo) == 2:
         binfo_a, binfo_b = binfo  # rows=A, cols=B
@@ -2305,11 +2640,10 @@ def plot_marginal_2d(
 
         if yc is not None and len(yc) == n_rows:
             y_centers = yc
-            centers_from_binfo_y = True
         if xc is not None and len(xc) == n_cols:
             x_centers = xc
-            centers_from_binfo_x = True
 
+    # If still None (should never happen), fall back to positional
     if x_centers is None:
         x_centers = np.arange(n_cols, dtype=float)  # positional fallback
     if y_centers is None:
@@ -2341,27 +2675,67 @@ def plot_marginal_2d(
                 text[i, j] = (format(Z[i, j], text_fmt) if np.isfinite(Z[i, j]) else "")
 
     # tick labels: centers if available, else level labels
-    def _fmt_centers(vals: np.ndarray) -> list[str]:
-        # compact numeric formatting for axis labels, using same helpers as elsewhere
-        _fmt = _best_num_formatter_for_series(vals)
-        return [_fmt(v) for v in vals]
+    x_ticktext = _infer_center_labels_from_levels(pivot.columns.astype(str).tolist(), x_centers)
+    y_ticktext = _infer_center_labels_from_levels(pivot.index.astype(str).tolist(), y_centers)
 
-    x_ticktext = _fmt_centers(x_centers) if centers_from_binfo_x else [str(c) for c in pivot.columns]
-    y_ticktext = _fmt_centers(y_centers) if centers_from_binfo_y else [str(r) for r in pivot.index]
+    # Hover uses param names + interval labels (formatted), else raw labels if not intervals
+    row_hover_labels = _format_intervals_like_user_wants(pivot.index)
+    col_hover_labels = _format_intervals_like_user_wants(pivot.columns)
 
-    # hover uses param names + level labels (not centers)+
-    customdata = np.stack(
+    row_labels_arr = np.asarray(row_hover_labels, dtype=object)
+    col_labels_arr = np.asarray(col_hover_labels, dtype=object)
+
+    # Find all DF-like stats with matching shape; default to all of them
+    def _is_eligible_stat(k: str, v: Any) -> bool:
+        return isinstance(v, pd.DataFrame) and v.shape == pivot.shape and list(v.index) == list(pivot.index) and list(v.columns) == list(pivot.columns)
+
+    all_stat_names = [k for k, v in pivots.items() if _is_eligible_stat(k, v)]
+    # If user specified some, respect order and intersect
+    if hover_stats is not None:
+        wanted = [s for s in hover_stats if s in all_stat_names]
+        # ensure we still show at least the heatmap's statistic
+        if statistic not in wanted and statistic in all_stat_names:
+            wanted = [statistic] + wanted
+        hover_stat_names = wanted
+    else:
+        hover_stat_names = all_stat_names  # show everything we can
+
+    # Build arrays (reindex_like for safety)
+    stat_arrays = []
+    for s in hover_stat_names:
+        arr = pivots[s].reindex_like(pivot).to_numpy(dtype=float)
+        stat_arrays.append(arr)
+
+    # customdata = [row_label, col_label, stat1, stat2, ...]
+    # we keep labels as strings, stats as floats (so we can format with :<fmt>)
+    # Shape: (n_rows, n_cols, 2 + num_stats)
+    customdata = np.concatenate(
         [
-            np.broadcast_to(np.array(pivot.index, dtype=object)[:, None], Z.shape),   # row labels (A)
-            np.broadcast_to(np.array(pivot.columns, dtype=object)[None, :], Z.shape)  # col labels (B)
+            np.stack(
+                [
+                    np.broadcast_to(row_labels_arr[:, None], Z.shape),
+                    np.broadcast_to(col_labels_arr[None, :], Z.shape),
+                ],
+                axis=-1,
+            ),
+            np.stack(stat_arrays, axis=-1) if stat_arrays else np.empty(Z.shape + (0,), dtype=float),
         ],
-        axis=-1
+        axis=-1,
     )
-    hovertemplate = (
-        f"{pname_a}: %{{customdata[0]}}<br>"
-        f"{pname_b}: %{{customdata[1]}}<br>"
-        f"{statistic}: %{{z:.4g}}<extra></extra>"
-    )
+
+    # Build hovertemplate dynamically:
+    # first lines = param labels; then one line per statistic with formatting
+    lines = [
+        f"{pname_a}: %{{customdata[0]}}",
+        f"{pname_b}: %{{customdata[1]}}",
+    ]
+    # Add one line per stat (order matches hover_stat_names)
+    # customdata indices for stats start at 2
+    for i, s in enumerate(hover_stat_names):
+        # If this stat is the color stat, show "(heatmap)" tag so it's obvious
+        tag = " (heatmap)" if s == statistic else ""
+        lines.append(f"{s}{tag}: %{{customdata[{2+i}]:{hover_value_fmt}}}")
+    hovertemplate = "<br>".join(lines) + "<extra></extra>"
 
     # --- heatmap ---
     hm = go.Heatmap(
@@ -2411,6 +2785,10 @@ def plot_marginals_2d(
     binning: Literal["quantile", "uniform", "unique"] = "quantile",
     bins_a: int = 5,
     bins_b: int | None = None,  # if None -> bins_a
+    custom_edges_dict_a: Dict[str, Sequence[SupportsFloat]] = {},
+    custom_quantiles_dict_a: Dict[str, Sequence[float]] = {},
+    custom_edges_dict_b: Dict[str, Sequence[SupportsFloat]] = {},
+    custom_quantiles_dict_b: Dict[str, Sequence[float]] = {},
     # plotting controls (passed into plot_marginal_2d)
     minimize: bool = True,
     colorscale_minimize: str = "Viridis",
@@ -2496,6 +2874,10 @@ def plot_marginals_2d(
             binning=binning,
             bins_a=bins_a,
             bins_b=bins_b,
+            custom_edges_a=custom_edges_dict_a.get(a) or custom_edges_dict_a.get(a.replace("params_", "", 1)),
+            custom_quantiles_a=custom_quantiles_dict_a.get(a) or custom_quantiles_dict_a.get(a.replace("params_", "", 1)),
+            custom_edges_b=custom_edges_dict_b.get(b) or custom_edges_dict_b.get(b.replace("params_", "", 1)),
+            custom_quantiles_b=custom_quantiles_dict_b.get(b) or custom_quantiles_dict_b.get(b.replace("params_", "", 1)),
         )
         pivots_by_pair[(a, b)] = piv
 
@@ -2516,7 +2898,7 @@ def plot_marginals_2d(
     ncols = max(1, int(ncols))
     nrows = math.ceil(n / ncols)
 
-    subplot_titles = [f"{a} x {b}" for (a, b) in ordered_pairs]
+    subplot_titles = [f"{a.replace('params_', '')} x {b.replace('params_', '')}" for (a, b) in ordered_pairs]
     fig = make_subplots(
         rows=nrows,
         cols=ncols,
@@ -2587,7 +2969,8 @@ def plot_marginals_2d(
     main_title = title or f"Pairwise heatmaps — {statistic}"
     fig.update_layout(
         title=dict(text=main_title),
-        height=375*nrows,   
+        height=375*nrows, 
+        width=min(1200, 500*ncols),  
     )
     fig.update_xaxes(automargin=True, title_standoff=20)
     fig.update_yaxes(automargin=True, title_standoff=20)

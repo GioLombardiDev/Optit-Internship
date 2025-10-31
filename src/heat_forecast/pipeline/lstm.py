@@ -12,7 +12,7 @@ import random
 import time
 from tqdm.notebook import tqdm
 
-from typing import Optional, Tuple, Literal, List, Union, Any
+from typing import Mapping, Optional, Tuple, Literal, List, Union, Any, Dict
 from dataclasses import dataclass, field, asdict
 
 import logging
@@ -1213,10 +1213,11 @@ class LSTMTrainer:
         lr: float = 1e-3,
         patience: int = 5,
         es_rel_delta: float = 0.0, # relative delta for early stopping
+        use_tf: bool = True,
         tf_mode: str = "linear",
         tf_drop_epochs: int = 15, 
         use_lr_drop: bool = True,
-        lr_drop_at_epoch: Optional[int] = None, # 1-based epoch
+        lr_drop_epoch: Optional[int] = None, # 1-based epoch
         lr_drop_factor: float = 0.5,              
         es_start_epoch: int = 1, # 1-based
         grad_clip_max_norm: Optional[float] = 10.0,
@@ -1242,13 +1243,15 @@ class LSTMTrainer:
             Early-stopping patience (epochs without improvement after `es_start_epoch`).
         es_rel_delta : float, default=0.0
             Required relative improvement to reset patience (e.g., 0.01 = 1% better).
+        use_tf : bool, default=True
+            If True, use scheduled teacher forcing.
         tf_mode : {"linear","step"}, default="linear"
             Teacher-forcing schedule shape.
         tf_drop_epochs : int, default=15
             Horizon (in epochs) over which TF decays from 1.0 to its late value.
         use_lr_drop : bool, default=True
-            If True, multiply LR by `lr_drop_factor` at `lr_drop_at_epoch` (or when TF hits zero).
-        lr_drop_at_epoch : int | None, default=None
+            If True, multiply LR by `lr_drop_factor` at `lr_drop_epoch` (or when TF hits zero).
+        lr_drop_epoch : int | None, default=None
             1-based epoch to drop LR; defaults to TF-zero boundary if None.
         lr_drop_factor : float, default=0.5
             LR multiplier when dropping (e.g., 0.5 halves the LR).
@@ -1285,14 +1288,14 @@ class LSTMTrainer:
                 raise ValueError("trial must be an instance of optuna.Trial or None.")
             if val_loader is None:
                 raise ValueError("val_loader must be provided when using optuna trial.")
-        if not isinstance(tf_drop_epochs, int) or tf_drop_epochs < 1 or tf_drop_epochs > n_epochs:
-            raise ValueError("tf_drop_epochs must be a positive integer in [1, n_epochs].")
-        if not isinstance(es_start_epoch, int) or es_start_epoch < 1 or es_start_epoch > n_epochs:
-            raise ValueError("es_start_epoch must be a positive integer in [1, n_epochs].")
+        if not isinstance(tf_drop_epochs, int) or tf_drop_epochs < 1:
+            raise ValueError("tf_drop_epochs must be a positive integer.")
+        if not isinstance(es_start_epoch, int) or es_start_epoch < 1:
+            raise ValueError("es_start_epoch must be a positive integer.")
         es_start_epoch_zb = es_start_epoch - 1  # zero-based
-        if lr_drop_at_epoch is not None and (not isinstance(lr_drop_at_epoch, int) or lr_drop_at_epoch < 1 or lr_drop_at_epoch > n_epochs):
-            raise ValueError("lr_drop_at_epoch must be a positive integer in [1, n_epochs].")
-        lr_drop_at_epoch_zb = (lr_drop_at_epoch - 1) if (lr_drop_at_epoch is not None) else None
+        if lr_drop_epoch is not None and (not isinstance(lr_drop_epoch, int) or lr_drop_epoch < 1):
+            raise ValueError("lr_drop_epoch must be a positive integer.")
+        lr_drop_at_epoch_zb = (lr_drop_epoch - 1) if (lr_drop_epoch is not None) else None
         if not isinstance(patience, int) or patience < 0:
             raise ValueError("patience must be a non-negative integer.")
         if not isinstance(n_epochs, int) or n_epochs < 1:
@@ -1310,8 +1313,11 @@ class LSTMTrainer:
         with_es_txt = "with" if use_es else "without"
         self._logger.info(f"[train] starting training {with_val_txt} validation and {with_es_txt} early stopping...")
         self._logger.info(
-            f"  Train params: epochs={n_epochs}, lr={lr}, patience={patience}, es_rel_delta={es_rel_delta}, tf_mode='{tf_mode}', tf_ep='{tf_drop_epochs}', use_lr_drop={use_lr_drop}, "
-            f"lr_ep={lr_drop_at_epoch}, lr_drop_factor={lr_drop_factor}, es_start_epoch={es_start_epoch}, max_grad_norm={grad_clip_max_norm}, weight_decay={weight_decay}"
+            f"  Train params: epochs={n_epochs}, lr={lr}, patience={patience}, es_rel_delta={es_rel_delta}, use_tf={use_tf}, "
+            + (f"tf_mode='{tf_mode}', tf_ep='{tf_drop_epochs}', " if use_tf else "")
+            + (f"use_lr_drop={use_lr_drop}, lr_ep={lr_drop_epoch}, lr_drop_factor={lr_drop_factor}, " if use_lr_drop else "")
+            + (f"es_start_epoch={es_start_epoch}, " if val_loader is not None else "")
+            + f"max_grad_norm={grad_clip_max_norm}, weight_decay={weight_decay}"
         )
         self._logger.info(f"  Data params: norm_mode={self.norm_mode}.")
         start_time = time.perf_counter()
@@ -1328,16 +1334,21 @@ class LSTMTrainer:
         else:
             param_groups = self.model.parameters()
             optimizer = torch.optim.Adam(param_groups, lr=lr)
-        tf_scheduler = TFScheduler(
-            drop_epochs=tf_drop_epochs,
-            mode=tf_mode,
-            logger=self._logger,
-        )
+        if use_tf:
+            tf_scheduler = TFScheduler(
+                drop_epochs=tf_drop_epochs,
+                mode=tf_mode,
+                logger=self._logger,
+            )
 
         # Default LR drop epoch when TF reaches zero
         # Note: _zero_start_ep is the boundary in "relative" epochs since start_epoch.
-        default_lr_drop_epoch = tf_scheduler.start_epoch + tf_scheduler._zero_start_ep  # 0-based comparison below
-        lr_drop_at_epoch_zb = lr_drop_at_epoch_zb if lr_drop_at_epoch_zb is not None else default_lr_drop_epoch
+        if lr_drop_at_epoch_zb is None and use_lr_drop:
+            if use_tf:
+                lr_drop_at_epoch_zb = tf_scheduler.start_epoch + tf_scheduler._zero_start_ep  # 0-based comparison below
+            else:
+                raise ValueError("lr_drop_epoch must be provided when use_tf is False and use_lr_drop is True.")
+
         if use_lr_drop:
             self._logger.info(f"[lr] will drop at epoch {lr_drop_at_epoch_zb+1} by x{lr_drop_factor}")
 
@@ -1368,18 +1379,19 @@ class LSTMTrainer:
             grad_norm_acc = []
 
             # ---- teacher forcing ---
-            tf_ratio = tf_scheduler.get_tf_ratio(epoch)  # 0-based epoch
-
-            # number of auto regressive decoder (teacher-forcing < 1.0) to hit for this epoch (based on tf_ratio)
-            N = len(train_loader.dataset)                    # total samples this epoch
-            target_ar_samples = int(round((1.0 - tf_ratio) * N))
-            ar_samples_left = target_ar_samples
-            samples_left = N
-
             tf_gen = None
-            if self.seed is not None:
-                seed_tf_epoch = derive_seed(self.seed, f"tf_epoch_{epoch}")
-                tf_gen = torch.Generator(device=self.device).manual_seed(seed_tf_epoch)
+            if use_tf:
+                tf_ratio = tf_scheduler.get_tf_ratio(epoch)  # 0-based epoch
+
+                # number of auto regressive decoder (teacher-forcing < 1.0) to hit for this epoch (based on tf_ratio)
+                N = len(train_loader.dataset)                    # total samples this epoch
+                target_ar_samples = int(round((1.0 - tf_ratio) * N))
+                ar_samples_left = target_ar_samples
+                samples_left = N
+
+                if self.seed is not None:
+                    seed_tf_epoch = derive_seed(self.seed, f"tf_epoch_{epoch}")
+                    tf_gen = torch.Generator(device=self.device).manual_seed(seed_tf_epoch)
 
             # ---- learning rate ---
             if use_lr_drop and first_time_decreasing_lr and epoch == lr_drop_at_epoch_zb:
@@ -1402,16 +1414,18 @@ class LSTMTrainer:
                 optimizer.zero_grad(set_to_none=True)
 
                 # enforce exact count of AR samples
-                B = batch["y_fut"].shape[0]  # batch size
-                p = ar_samples_left / max(1, samples_left) # probability to choose AR for this batch
-                force_ar = ar_samples_left >= samples_left - B
-                rand_u = torch.rand((), device=self.device, generator=tf_gen) if tf_gen is not None else torch.rand((), device=self.device)
-                take_ar = force_ar or (rand_u < p)
-                tf_for_this_batch = 0.0 if take_ar else 1.0
+                tf_for_this_batch = 0.0  # default: no teacher forcing
+                if use_tf:
+                    B = batch["y_fut"].shape[0]  # batch size
+                    p = ar_samples_left / max(1, samples_left) # probability to choose AR for this batch
+                    force_ar = ar_samples_left >= samples_left - B
+                    rand_u = torch.rand((), device=self.device, generator=tf_gen) if tf_gen is not None else torch.rand((), device=self.device)
+                    take_ar = force_ar or (rand_u < p)
+                    tf_for_this_batch = 0.0 if take_ar else 1.0
 
-                if take_ar:
-                    ar_samples_left -= B
-                samples_left -= B   
+                    if take_ar:
+                        ar_samples_left -= B
+                    samples_left -= B   
 
                 # forward
                 _maybe_sync()
@@ -1459,7 +1473,10 @@ class LSTMTrainer:
                 total_train_loss_cnt += (B * T)
 
                 if self.debug.log_grad_norm_every and (bidx % self.debug.log_grad_norm_every == 0):
-                    self._logger.debug(f"[ep {epoch+1} b{bidx}] grad_norm={float(total_norm):.4f} tf={tf_ratio:.3f}")
+                    self._logger.debug(
+                        f"[ep {epoch+1} b{bidx}] grad_norm={float(total_norm):.4f} " \
+                        + (f"tf={tf_ratio:.3f}" if use_tf else "")
+                    )
 
                 # end-of-iteration timestamp for next loader wait measure
                 t_prev_end = time.perf_counter()
@@ -1478,19 +1495,19 @@ class LSTMTrainer:
                 t_eval += (time.perf_counter() - t0)
                 self.val_losses_orig.append(val_loss_orig)
                 self._logger.info(
-                    f"Epoch {epoch+1:{len_str_n_epochs}d}/{n_epochs} "
-                    f"- train(orig)={train_loss_orig:.4f} "
-                    f"- val(orig)={val_loss_orig:.4f} "
-                    f"- tf_ratio={tf_ratio:.3f} "
-                    f"- lr={optimizer.param_groups[0]['lr']:.3e} "
-                    f"- grad(mean-of-current)={np.mean(grad_norm_acc):.3f}"
+                    f"Epoch {epoch+1:{len_str_n_epochs}d}/{n_epochs} " \
+                    + f"- train(orig)={train_loss_orig:.4f} " \
+                    + f"- val(orig)={val_loss_orig:.4f} " \
+                    + (f"- tf_ratio={tf_ratio:.3f} " if use_tf else "") \
+                    + f"- lr={optimizer.param_groups[0]['lr']:.3e} " \
+                    + f"- grad(mean-of-current)={np.mean(grad_norm_acc):.3f}"
                 )
             else:
                 self._logger.info(
                     f"Epoch {epoch+1:{len_str_n_epochs}d}/{n_epochs} "
-                    f"- train(orig)={train_loss_orig:.4f} "
-                    f"- tf_ratio={tf_ratio:.3f}"
-                    f"- lr={optimizer.param_groups[0]['lr']:.3e} "
+                    f"- train(orig)={train_loss_orig:.4f} " \
+                    + (f"- tf_ratio={tf_ratio:.3f} " if use_tf else "") \
+                    + f"- lr={optimizer.param_groups[0]['lr']:.3e} "
                 )
 
             # epoch totals
@@ -1509,7 +1526,7 @@ class LSTMTrainer:
                 )
 
             # Save history row
-            row = dict(epoch=epoch+1, train_orig=train_loss_orig, tf=tf_ratio,
+            row = dict(epoch=epoch+1, train_orig=train_loss_orig, tf=tf_ratio if use_tf else None,
                     grad_mean=float(np.mean(grad_norm_acc)),
                     epoch_time_sec=float(t_epoch_total))
             if val_loader is not None:
@@ -1845,8 +1862,8 @@ class TrainConfig:
     tf_drop_epochs : int
         Horizon (epochs) used by TFScheduler to move from initial TF to late TF.
     use_lr_drop : bool
-        If True, multiply LR by `lr_drop_factor` at `lr_drop_at_epoch` (or when TF reaches zero).
-    lr_drop_at_epoch : Optional[int]
+        If True, multiply LR by `lr_drop_factor` at `lr_drop_epoch` (or when TF reaches zero).
+    lr_drop_epoch : Optional[int]
         1-based epoch index to drop LR. If None, defaults to TF zero-start epoch.
     lr_drop_factor : float
         Factor in (0,1): new_lr = old_lr * lr_drop_factor.
@@ -1866,7 +1883,7 @@ class TrainConfig:
     tf_mode: Literal["linear", "step"] = "linear"
     tf_drop_epochs: int = 15
     use_lr_drop: bool = True
-    lr_drop_at_epoch: Optional[int] = None # 1-based epoch
+    lr_drop_epoch: Optional[int] = None # 1-based epoch
     lr_drop_factor: float = 0.5              
     es_start_epoch: int = 1 # 1-based
     grad_clip_max_norm: float = 10.0
@@ -1930,7 +1947,8 @@ class LSTMPipeline:
             target_df: pd.DataFrame,  
             config: LSTMRunConfig,
             aux_df: Optional[pd.DataFrame] = None, 
-            logger: Optional[logging.Logger] = None
+            logger: Optional[logging.Logger] = None,
+            device: Optional[torch.device] = None,
         ):
         """
         End-to-end pipeline that:
@@ -1939,6 +1957,11 @@ class LSTMPipeline:
         3) instantiates and trains `EncDecLSTM`,
         4) evaluates/predicts (including Δ24 recovery),
         5) supports rolling cross-validation.
+
+        Notes
+        -----------
+        - the pipeline automaticcally sets device to "cuda" if available,
+          use the argument to override.
 
         Assumptions
         -----------
@@ -1950,7 +1973,14 @@ class LSTMPipeline:
         self._aux_df = aux_df
         self.config = config
         self._logger = logger or logging.getLogger(__name__)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is not None and isinstance(device, torch.device):
+            self.device = device
+            lines_to_log = [f"[pipe init] using provided device: {self.device.type}"]
+        else:
+            if device is not None: # -> device was provided but not a torch.device
+                self._logger.warning(f"device argument must be torch.device or None; got {type(device)}. Auto-selecting device.")
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            lines_to_log = [f"[pipe init] auto-selected device: {self.device.type}"]
 
         # internal attributes initialized during data preparation
         self._endog_df = None
@@ -1978,7 +2008,7 @@ class LSTMPipeline:
         # --- Set seeds if requested ---
 
         if self.config.seed is not None:
-            self._logger.info(f"[pipe init] setting random seed: {self.config.seed}")
+            lines_to_log.append(f"setting random seed: {self.config.seed}")
             set_global_seed(self.config.seed)
 
         # --- Check coherence of params ---
@@ -2023,6 +2053,8 @@ class LSTMPipeline:
             missing_vars = [var for var in self.config.features.exog_vars if var not in aux_df.columns]
             if missing_vars:
                 raise ValueError(f"The following exogenous variables are missing in aux_df: {missing_vars}")
+
+        self._logger.info("; ".join(lines_to_log) + '.')
             
     # ------------------------------
     # Data Preparation
@@ -2380,6 +2412,7 @@ class LSTMPipeline:
         want_train = "train" in ranges
         want_val   = "val"   in ranges
         T_in = int(self.config.model.input_len)
+        T_out = int(self.config.model.output_len)
 
         # ---- global-stats policy (your 1-2-3 rules) ----
         norm_mode = getattr(self.config.norm, "mode", "none")
@@ -2411,7 +2444,7 @@ class LSTMPipeline:
         seed_val   = derive_seed(self.config.seed, "val_loader")   if (self.config.seed is not None and want_val)   else None
 
         train_loader = val_loader = None
-        parts = []
+        parts = [f"T_in={T_in}, T_out={T_out}"]
 
         if want_train:
             cut = self._end_train - pd.Timedelta(hours=gap_hours)
@@ -2490,11 +2523,12 @@ class LSTMPipeline:
         uses_diff = bool(getattr(feats, "use_differences", False))
 
         # Model I/O sizes
-        T_in  = int(self.config.model.input_len)
-        T_out = int(self.config.model.output_len)
+        mc = self.config.model
+        T_in  = int(mc.input_len)
+        T_out = int(mc.output_len)
         enc_in = int(self._endog_df.shape[1] + self._exog_df.shape[1])
         C_endog_fut = len(self._endog_df.columns) - len(self._endog_vars_not_for_future)
-        use_ar = getattr(self.config.model, "use_ar", "none")
+        use_ar = getattr(mc, "use_ar", "none")
         add_prev = 1 if use_ar in ["prev", "24h"] else 0
         dec_in = int(add_prev + C_endog_fut + self._exog_df.shape[1])
 
@@ -2591,7 +2625,8 @@ class LSTMPipeline:
         self._n_params = nparams
 
         if not silent:
-            self._logger.info(f"[model] EncDecLSTM(hidden={self.config.model.hidden_size}, "
+            self._logger.info(f"[model] EncDecLSTM(T_in={self.config.model.input_len}, T_out={self.config.model.output_len}, "
+                            f"hidden={self.config.model.hidden_size}, "
                             f"n_layers={self.config.model.num_layers}, "
                             f"head={self.config.model.head}, "
                             f"dropout={self.config.model.dropout}, "
@@ -2643,6 +2678,7 @@ class LSTMPipeline:
         )
 
         # Train
+        use_tf = self.config.model.use_ar in ["prev", "24h"]
         out = trainer.train(
             train_loader=train_loader,
             val_loader=val_loader,
@@ -2653,13 +2689,14 @@ class LSTMPipeline:
             tf_mode=self.config.train.tf_mode,
             tf_drop_epochs=self.config.train.tf_drop_epochs,
             use_lr_drop=self.config.train.use_lr_drop,
-            lr_drop_at_epoch=self.config.train.lr_drop_at_epoch,
+            lr_drop_epoch=self.config.train.lr_drop_epoch,
             lr_drop_factor=self.config.train.lr_drop_factor,
             es_start_epoch=self.config.train.es_start_epoch,
             grad_clip_max_norm=self.config.train.grad_clip_max_norm,
             weight_decay=self.config.train.weight_decay,
             trial=trial,
             max_walltime_sec=self.config.train.max_walltime_sec,
+            use_tf=use_tf
         )
 
         # Store diagnostics
@@ -2853,7 +2890,7 @@ class LSTMPipeline:
         )
 
 
-    def predict(
+    def forward(
         self,
         val_loader: DataLoader | None = None,
         cutoff: pd.Timestamp | None = None,
@@ -2909,10 +2946,10 @@ class LSTMPipeline:
             raise RuntimeError("unique_id not set on the pipeline.")
 
         records = []
-        starts = ds.starts
-        idx_series = ds.index
-        T_in = ds.T_in
-        T_out = ds.T_out
+        starts: List[int] = ds.starts
+        idx_series: pd.Index = ds.index # datetime index of the original series
+        T_in: int = ds.T_in
+        T_out: int = ds.T_out
 
         seen = 0
         with torch.no_grad():
@@ -2997,7 +3034,7 @@ class LSTMPipeline:
         levels : list[int] | None
             Ignored (no PI support); a warning is logged if provided.
         refit : bool | int, default=True
-            True: refit every window; False: fit once; int k: refit every k windows.
+            True or None: refit every window; False: fit once; int k: refit every k windows.
         verbose : bool, default=True
             Show progress bar with `tqdm`.
         alias : str, default="LSTM"
@@ -3074,6 +3111,7 @@ class LSTMPipeline:
                 i == 0
                 or (isinstance(refit, int) and not isinstance(refit, bool) and i % int(refit) == 0)
                 or (refit is True)
+                or (refit is None)
             )
 
             if do_refit or prev_pipeline is None:
@@ -3099,7 +3137,6 @@ class LSTMPipeline:
                     end_train=end_train,
                     start_val=None,
                     end_val=None,
-                    gap_hours=self.config.data.gap_hours,
                 )
                 pipeline.fit(train_loader, val_loader=None)
                 prev_pipeline = pipeline
@@ -3107,7 +3144,7 @@ class LSTMPipeline:
                 pipeline = prev_pipeline
 
             # forecast h steps after cutoff
-            fc = pipeline.predict(cutoff=cutoff, alias=alias)  # returns columns: [unique_id, ds, LSTM]
+            fc = pipeline.forward(cutoff=cutoff, alias=alias)  # returns columns: [unique_id, ds, LSTM]
 
             # ground truth for (cutoff, cutoff + h]
             mask = (self._target_plus_aux_df.index > cutoff) & (self._target_plus_aux_df.index <= cutoff + pd.Timedelta(hours=h))
@@ -3259,4 +3296,72 @@ class LSTMPipeline:
         if return_dict:
             return summary
         return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# For Optuna objective function
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fit_for_optuna(
+    *,
+    trial: optuna.trial.Trial,
+    target_df: pd.DataFrame,
+    aux_df: pd.DataFrame,
+    cfg: LSTMRunConfig,
+    start_train: pd.Timestamp | None, end_train: pd.Timestamp | None,
+    start_val: pd.Timestamp | None, end_val: pd.Timestamp | None,
+    logger: logging.Logger | None = None,
+) -> Dict[str, Any]:
+    """
+    Fit the LSTM model for Optuna hyperparameter optimization.
+    """
+    logger = logger or logging.getLogger(__name__)
+    pipe = LSTMPipeline(
+        target_df=target_df,
+        aux_df=aux_df,
+        config=cfg,
+        logger=logger,
+    )
+    # loaders (computes global stats if needed)
+    train_loader, val_loader = pipe.make_loaders(
+        start_train=start_train, end_train=end_train,
+        start_val=start_val,     end_val=end_val,
+    )
+    # train with pruning support (pipeline forwards `trial` to trainer)
+    out = pipe.fit(train_loader, val_loader=val_loader, trial=trial)
+    out_optuna: Dict[str, Any] = {}
+    out_optuna['n_params'] = pipe.n_params
+    trainer = pipe._trainer
+
+    best_val = out.get('best_val_loss_orig')
+    out_optuna['best_val'] = float(best_val) if best_val is not None else None
+
+    best_epoch = out.get('best_epoch')
+    out_optuna['best_epoch'] = int(best_epoch) if best_epoch is not None else None
+    
+    dur = out.get('duration_until_best')
+    out_optuna['duration_until_best'] = dur
+
+    out_optuna['duration_until_best_s'] = float(dur.total_seconds()) if dur is not None else None
+
+    avg_near_best = out.get('avg_near_best')
+    out_optuna['avg_near_best'] = float(avg_near_best) if avg_near_best is not None else None
+    
+    last_val = trainer.val_losses_orig[-1] if trainer.val_losses_orig else None
+    out_optuna['last_val'] = float(last_val) if last_val is not None else None
+
+    return out_optuna
+
+def config_builder(cfg_dict: Mapping['str', Any]) -> LSTMRunConfig:
+    """
+    Build an LSTMRunConfig from a generic dict.
+    """
+    return LSTMRunConfig(
+        model = ModelConfig.from_dict(cfg_dict.get("model", {})),
+        training = TrainConfig.from_dict(cfg_dict.get("training", {})),
+        data = DataConfig.from_dict(cfg_dict.get("data", {})),
+        features = FeatureConfig.from_dict(cfg_dict.get("features", {})),
+        norm = NormalizeConfig.from_dict(cfg_dict.get("norm", {})),
+        seed = cfg_dict.get("seed", None)
+    )
 

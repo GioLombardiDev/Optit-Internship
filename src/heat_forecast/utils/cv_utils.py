@@ -382,7 +382,7 @@ def display_info_cv(
         'Windows': len(cutoffs),
         'First cutoff': first_cutoff,
         'Last cutoff': last_cutoff,
-        'Step size (hours)': step_size,
+        'Step size (days)': step_size,
     } 
 
     def _formatter(value):
@@ -412,7 +412,6 @@ def get_cv_params_for_test(
         use_deprecated: bool = False, # If True, use the old CV plan 
         logger: Optional[logging.Logger] = None,
         unique_id: Optional[str] = None, # 'F1', 'F2', 'F3', 'F4', 'F5', only needed if use_deprecated=True
-        final: bool = False
     ) -> tuple[int, int, pd.Timestamp, int]:
     """
     Convenience wrapper that selects a pre-defined CV plan for a given series

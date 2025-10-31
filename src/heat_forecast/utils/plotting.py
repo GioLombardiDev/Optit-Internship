@@ -14,9 +14,15 @@ from statsforecast.models import SeasonalNaive
 from IPython.display import display
 from matplotlib import colors
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.express as px
+from IPython.display import HTML, display
 from matplotlib.ticker import FuncFormatter, MultipleLocator
 import ipywidgets as widgets
 from IPython.display import HTML
+from statsmodels.tsa.stattools import acf
+from scipy.stats import gaussian_kde
+import copy
 
 from .transforms import make_is_winter, get_lambdas, make_transformer, transform_column
 
@@ -833,95 +839,318 @@ def interactive_plot_cutoff_results(
 
     return None
 
-import ipywidgets as widgets
-from plotly.tools import mpl_to_plotly
+def display_scrollable(fig: go.Figure, container_width: str = "100%", max_height: Optional[int] = None):
+    """
+    Display a Plotly figure inside a horizontally scrollable container.
+    You can call this any time, even after updating fig width/height.
 
-def plotly_forecasts_with_exog(
-    *,
+    Parameters
+    ----------
+    fig : go.Figure
+        The Plotly figure to render.
+    container_width : str, default "100%"
+        CSS width of the outer container (e.g., "100%", "900px").
+    max_height : int | None
+        If provided, fixes the container's max height and enables vertical scrolling.
+    """
+    style = f"width:{container_width}; overflow-x:auto; border:0; padding:0; margin:0;"
+    if max_height is not None:
+        style += f" max-height:{max_height}px; overflow-y:auto;"
+    html = fig.to_html(include_plotlyjs="cdn", full_html=False)
+    display(HTML(f'<div style="{style}">{html}</div>'))
+
+def plotly_cutoffs_with_exog(
     target_df: pd.DataFrame,
     cv_df: pd.DataFrame,
-    aux_df=None,
-    exog_vars=None,
-    n_windows: int = 1,
-    models=None,
-    id=None,
-    add_context: bool = False,
-    levels=None,
+    start_offset: int,
+    end_offset: int,
+    *,
+    aux_df: Optional[pd.DataFrame] = None,
+    exog_vars: Optional[Sequence[str]] = None,
+    levels: Optional[Sequence[int]] = None,
+    models: Optional[Sequence[str]] = None,
+    id: Optional[str] = None,
+    highlight_dayofweek: bool = False,
+    order_of_models: Optional[Sequence[str]] = None,
     alpha: float = 0.9,
-    order_of_models=None,
-    figsize=None,
-    only_aligned_to_day: bool = True,
-    start_offset: int = 48,
-    end_offset: int = 48,
-):
-    # --- prep once
-    cv_df = cv_df.copy()
-    cv_df["cutoff"] = pd.to_datetime(cv_df["cutoff"])
-    if only_aligned_to_day:
-        cv_df = cv_df[cv_df["cutoff"].dt.hour == 23].copy()
+    base_height_per_panel: int = 300,
+    width_per_day: int = 60,
+    grayscale_safe: bool = False,
+    title: Optional[str] = "Forecast Results",
+) -> go.Figure:
+    """
+    Interactive Plotly version that plots *all* available cutoffs (no filtering)
+    and ensures consistent colors per model. No context subplot.
+    """
 
-    cutoffs = sorted(cv_df["cutoff"].unique())
-    if len(cutoffs) < max(1, n_windows):
-        raise ValueError("Not enough cutoffs for the requested window size.")
+    target_col = "y"
+    if not isinstance(target_df, pd.DataFrame) or not isinstance(cv_df, pd.DataFrame):
+        raise TypeError("target_df and cv_df must be pandas DataFrames.")
+    if aux_df is not None and not isinstance(aux_df, pd.DataFrame):
+        raise TypeError("aux_df must be a pandas DataFrame if provided.")
 
-    slider = widgets.IntSlider(
-        value=len(cutoffs)//2, min=0, max=len(cutoffs)-1, step=1,
-        description="Cutoff idx:", continuous_update=False
+    levels = list(levels or [])
+    exog_vars = list(exog_vars or [])
+
+    # --- Model discovery
+    all_models = [
+        c for c in cv_df.columns
+        if c not in {"ds", "unique_id", "y", "cutoff"}
+        and "-lo-" not in c and "-hi-" not in c
+    ]
+    if models is None:
+        models = all_models
+    else:
+        unknown = set(models) - set(all_models)
+        if unknown:
+            raise ValueError(f"Unknown model columns: {', '.join(unknown)}")
+
+    # Order models
+    if order_of_models:
+        extra = [m for m in models if m not in order_of_models]
+        ordered_models = list(order_of_models) + extra
+    else:
+        ordered_models = list(models)
+
+    # --- Choose ID
+    all_ids = cv_df["unique_id"].unique()
+    if len(all_ids) > 1 and id is None:
+        raise ValueError("Multiple unique_id values found, please specify one with `id`.")
+    if id is not None and id not in set(all_ids):
+        raise ValueError(f"Unknown unique_id: {id}")
+    if id is None:
+        id = all_ids[0]
+
+    target_id_df = target_df[target_df["unique_id"] == id]
+    if target_id_df.empty:
+        raise ValueError(f"No target series found for unique_id={id}")
+
+    cut_df = cv_df[cv_df["unique_id"] == id].copy()
+    if cut_df.empty:
+        raise ValueError("No rows in cv_df for the selected unique_id.")
+
+    # --- Keep only required columns
+    keep_cols = ["ds", "unique_id", "cutoff"] + ordered_models
+    for lv in levels:
+        keep_cols += [f"{m}-lo-{lv}" for m in ordered_models]
+        keep_cols += [f"{m}-hi-{lv}" for m in ordered_models]
+    keep_cols = [c for c in keep_cols if c in cut_df.columns]
+    cut_df = cut_df[keep_cols]
+
+    # --- Plot limits
+    plot_start = cut_df["ds"].min() - pd.Timedelta(hours=start_offset)
+    plot_end   = cut_df["ds"].max() + pd.Timedelta(hours=end_offset)
+
+    # --- Create subplots (no context)
+    n_exog = len(exog_vars)
+    rows = 1 + n_exog
+    specs = [[{}] for _ in range(rows)]
+    row_titles = ["Forecasts"] + [f"{v}" for v in exog_vars]
+
+    fig = make_subplots(
+        rows=rows, cols=1, shared_xaxes=True,
+        vertical_spacing=0.04,
+        subplot_titles=None
     )
-    out = widgets.Output()
 
-    def _strip_legends_inplace(mfig):
-        for ax in mfig.get_axes():
-            leg = ax.get_legend()
-            if leg is not None:
-                try: leg.remove()
-                except Exception: leg.set_visible(False)
-            try: ax.legend_ = None
-            except Exception: pass
+    # --- Highlight weekdays in background
+    if highlight_dayofweek:
+        # pleasant, very light tints for the 7 weekdays
+        dow_rgb = [
+            (141, 211, 199),  # Mon
+            (255, 255, 179),  # Tue
+            (190, 186, 218),  # Wed
+            (251, 128, 114),  # Thu
+            (128, 177, 211),  # Fri
+            (253, 180, 98),   # Sat
+            (179, 222, 105),  # Sun
+        ]
+        def rgba(rgb, a):
+            r, g, b = rgb
+            return f"rgba({r},{g},{b},{a})"
 
-    def _select(idx: int):
-        half = (n_windows-1)//2
-        start = max(0, idx - half)
-        end   = min(len(cutoffs), idx + half + 1 + int(n_windows % 2 == 0))
-        return cutoffs[start:end]
+        # Day boundaries spanning full plot range
+        day0 = pd.to_datetime(plot_start.floor("D"))
+        dayN = pd.to_datetime(plot_end.ceil("D"))
+        days = pd.date_range(day0, dayN, freq="D")
 
-    def _render(idx: int):
-        selected_cutoffs = _select(idx)
+        # Add one rectangle per day across ALL rows using yref='paper'
+        # so it covers the full vertical canvas of the subplots.
+        for d_start in days:
+            d_end = d_start + pd.Timedelta(days=1)
+            # mid point for annotation
+            x_mid = d_start + (d_end - d_start) / 2
+            wday = int(d_start.weekday())  # Monday=0 .. Sunday=6
+            fill = rgba(dow_rgb[wday], 0.08)  # very subtle
+            if not grayscale_safe:
+                fig.add_shape(
+                    type="rect",
+                    xref="x",
+                    yref="paper",
+                    x0=d_start, x1=d_end,
+                    y0=0, y1=1,
+                    line=dict(width=0),
+                    fillcolor=fill,
+                    layer="below",
+                )
+            # Label at the very top (above traces and grid)
+            fig.add_annotation(
+                x=x_mid,
+                y=1,
+                xref="x",
+                yref="paper",
+                yshift=16,
+                text=d_start.strftime("%a"),
+                showarrow=False,
+                font=dict(size=10),
+                align="center"
+            )
 
-        mfig = plot_cutoff_results_with_exog(
-            target_df=target_df,
-            cv_df=cv_df,
-            start_offset=start_offset,
-            end_offset=end_offset,
-            aux_df=aux_df,
-            exog_vars=exog_vars,
-            cutoffs=selected_cutoffs,
-            models=models,
-            id=id,
-            add_context=add_context,
-            levels=levels,
-            alpha=alpha,
-            order_of_models=order_of_models,
-            figsize=figsize,
+    # --- Target historical (main panel)
+    mask_train = (target_id_df["ds"] >= plot_start) & (target_id_df["ds"] <= plot_end)
+    train_grp = target_id_df.loc[mask_train, ["ds", target_col]]
+
+    fig.add_trace(
+        go.Scatter(
+            x=train_grp["ds"], y=train_grp[target_col],
+            name="Target", mode="lines",
+            line=dict(width=2, color="black"),
+            legendgroup="__target__", showlegend=True
+        ),
+        row=1, col=1
+    )
+
+    # --- Fixed color mapping per model
+    if grayscale_safe:
+        palette = ["#111111", "#B3B2B2"]
+        ordered_models = ['placeholder'] + ordered_models  # shift by 1
+    else:
+        palette = px.colors.qualitative.Set2
+    step = max(1, len(palette) // max(1, len(ordered_models)))
+    color_map = {
+        m: palette[(i * step) % len(palette)]
+        for i, m in enumerate(ordered_models)
+    }
+
+
+    # --- Forecasts (all cutoffs, consistent colors)
+    unique_cutoffs = pd.to_datetime(cut_df["cutoff"].unique())
+    first_cutoff = unique_cutoffs.min() if len(unique_cutoffs) else None
+
+    for cutoff_val in sorted(unique_cutoffs):
+        f_grp = cut_df[cut_df["cutoff"] == cutoff_val]
+        for model in ordered_models:
+            if model not in f_grp.columns:
+                continue
+            c = color_map[model]
+            fig.add_trace(
+                go.Scatter(
+                    x=f_grp["ds"], y=f_grp[model],
+                    name=model,
+                    mode="lines",
+                    line=dict(width=2, color=c),
+                    opacity=alpha,
+                    legendgroup=model,
+                    showlegend=(cutoff_val == first_cutoff)
+                ),
+                row=1, col=1
+            )
+            # Prediction intervals
+            for lv in levels:
+                lo_col = f"{model}-lo-{lv}"
+                hi_col = f"{model}-hi-{lv}"
+                if lo_col in f_grp.columns and hi_col in f_grp.columns:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=f_grp["ds"], y=f_grp[lo_col],
+                            mode="lines",
+                            line=dict(width=0, color=c),
+                            hoverinfo="skip",
+                            showlegend=False
+                        ),
+                        row=1, col=1
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=f_grp["ds"], y=f_grp[hi_col],
+                            mode="lines",
+                            line=dict(width=0, color=c),
+                            fill="tonexty",
+                            opacity=0.2,
+                            name=f"{model} {lv}% PI",
+                            hoverinfo="skip",
+                            legendgroup=f"{model}-pi-{lv}",
+                            showlegend=(cutoff_val == first_cutoff)
+                        ),
+                        row=1, col=1
+                    )
+
+    # --- Exogenous panels
+    exog_vars_to_name = {
+        'temperature': 'Temperature (°C)',
+        'humidity': 'Humidity (%)',
+        'wind_speed': 'Wind Speed (m/s)',
+    }
+    line_styles = ["solid", "dot", "dash", "longdash", "dashdot"]
+    if aux_df is not None and n_exog > 0:
+        missing_exog = set(exog_vars) - set(aux_df.columns)
+        if missing_exog:
+            raise ValueError(f"Missing exogenous vars: {', '.join(missing_exog)}")
+        aux_grp = aux_df[
+            (aux_df["unique_id"] == id) &
+            (aux_df["ds"] >= plot_start) &
+            (aux_df["ds"] <= plot_end)
+        ].copy()
+        for i, exog in enumerate(exog_vars, start=1):
+            fig.add_trace(
+                go.Scatter(
+                    x=aux_grp["ds"], y=aux_grp[exog],
+                    name=exog.capitalize(),
+                    mode="lines",
+                    showlegend=grayscale_safe,
+                    line=dict(
+                        color="gray" if grayscale_safe else "blue",
+                        dash=line_styles[i % len(line_styles)]
+                    ),
+                ),
+                row=1+i, col=1
+            )
+            fig.update_yaxes(title_text=exog_vars_to_name.get(exog, ""), row=1+i, col=1)
+
+    # --- Axes & layout
+    total_hours = max(1, int((plot_end - plot_start) / pd.Timedelta(hours=1)))
+    total_days = total_hours / 24.0
+    fig_width = int(min(40000, max(1, total_days * width_per_day)))
+
+    for r in range(1, rows+1):
+        fig.update_xaxes(showgrid=True, tickformat=r"%Y-%m-%d", row=r, col=1)
+        fig.update_yaxes(showgrid=True, zeroline=False, row=r, col=1)
+
+    fig.update_layout(
+        height=base_height_per_panel * rows,
+        width=fig_width,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=50, r=30, t=20, b=40)
+    )
+    if title is not None:
+        fig.update_layout(        
+            title=dict(
+                text=title,
+                x=0.5,               # center horizontally
+                xanchor="center",
+                y=0.98,              # slightly higher placement
+                yanchor="top",
+                font=dict(size=18)   # bigger, cleaner title
+            ),
+            margin=dict(t=80)  # extra top margin for title
         )
-        _strip_legends_inplace(mfig)
-        pfig = mpl_to_plotly(mfig)
-        plt.close(mfig)  # prevent MPL from also rendering
-
-        with out:
-            out.clear_output(wait=True)  # ← ensures ONLY one figure is shown
-            display(pfig)                # ← no fig.show(), no print()
-
-    def _on_change(change):
-        if change["name"] == "value":
-            _render(change["new"])
-
-    slider.observe(_on_change, names="value")
-    _render(slider.value)  # initial draw
-    
-    ui = widgets.VBox([slider, out])
-    display(ui)
-    return
+    fig.update_xaxes(title_text="Date Time", row=rows, col=1)
+    fig.update_yaxes(title_text="Heat Demand (kW/h)", row=1, col=1)
+    if grayscale_safe:
+        fig.update_layout(template="plotly_white")
+        fig.update_xaxes(showgrid=True, gridcolor="rgb(235,235,235)")
+        fig.update_yaxes(showgrid=True, gridcolor="rgb(235,235,235)")
+    return fig
 
 def custom_plot_results(
     target_df: pd.DataFrame,
@@ -1216,11 +1445,10 @@ def custom_plot_exog(
     fig.tight_layout(rect=[0, 0, 1, 0.97])                      # leave the top 3% for the suptitle
     return fig
 
-
 def plot_daily_seasonality(
     target_df: pd.DataFrame,
     *,
-    only_cold_months: bool = True,
+    only_cold_months: bool = False,
     make_is_winter: Callable[[str], Callable[[pd.Timestamp], bool]] = make_is_winter,
     transform: str = "none",
     lambda_window: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,
@@ -1335,7 +1563,7 @@ def plot_daily_seasonality(
 
     # Create one subplot per id
     n = len(ids)
-    fig, axes = plt.subplots(nrows=n, ncols=1, figsize=(9, 3 * n), sharex=False)
+    fig, axes = plt.subplots(nrows=n, ncols=1, figsize=(9, 5 * n), sharex=False)
     axes = np.atleast_1d(axes).ravel()
 
     for ax, (uid, grp) in zip(axes, plot_df.groupby("unique_id")):
@@ -1832,3 +2060,672 @@ def scatter_temp_vs_target_hourly(
     pivot_corr = corr_df.pivot(index='Season', columns='Hour', values='Correlation')
 
     return pivot_corr
+
+def add_season_background(fig, start, end):
+    """
+    Adds shaded rectangles for each meteorological season
+    (Spring: Mar-May, Summer: Jun-Aug, Autumn: Sep-Nov, Winter: Dec-Feb)
+    across the full range from start to end.
+    """
+    season_colors = {
+        "Spring": "rgba(144, 238, 144, 0.15)",  # light green
+        "Summer": "rgba(255, 215, 0, 0.10)",    # light yellow
+        "Autumn": "rgba(255, 165, 0, 0.15)",    # light orange
+        "Winter": "rgba(135, 206, 235, 0.15)"   # light blue
+    }
+
+    years = range(start.year, end.year + 1)
+    for year in years:
+        # Define date ranges for each season
+        seasons = {
+            "Spring": (datetime(year, 3, 21), datetime(year, 5, 20, 23, 59)),
+            "Summer": (datetime(year, 5, 21), datetime(year, 9, 20, 23, 59)),
+            "Autumn": (datetime(year, 9, 21), datetime(year, 12, 20, 23, 59)),
+            "Winter": (datetime(year, 12, 21), datetime(year + 1, 3, 20, 23, 59))
+        }
+
+        for season, (s, e) in seasons.items():
+            # Clip shading to data range
+            s_clipped = max(s, start)
+            e_clipped = min(e, end)
+            if s_clipped < end and e_clipped > start:
+                fig.add_shape(
+                    type="rect",
+                    x0=s_clipped,
+                    x1=e_clipped,
+                    y0=0,
+                    y1=1,
+                    yref="paper",
+                    fillcolor=season_colors[season],
+                    line=dict(width=0),
+                    layer="below"
+                )
+                # annotation label for first year only
+                fig.add_annotation(
+                    x=s_clipped + (e_clipped - s_clipped)/2,
+                    y=1.0,
+                    xref="x", yref="paper",
+                    text=season,
+                    showarrow=False,
+                    font=dict(size=10, color="gray")
+                )
+
+def plotly_daily_seasonality(
+    target_df: pd.DataFrame,
+    *,
+    ids: Optional[Iterable[str]] = None,
+    width: int = 900,
+    height_per_id: int = 500,
+    show_legend: bool = True,
+    colors: Optional[Any] = None,
+    display_fig: bool = True,
+) -> go.Figure:
+    """
+    Interactive Plotly version of 'plot_daily_seasonality'.
+
+    Rows: one subplot per unique_id.
+    X: hour of day [0..23].
+    Lines: per-month mean profile (fixed month palette).
+    Ribbon: 10th-90th percentile across winter days for each month-hour.
+
+    Returns
+    -------
+    fig : plotly.graph_objs.Figure
+    lambdas : dict {unique_id: lambda}  (empty if no Box-Cox applied)
+    """
+    # --- Validate and subset ids
+    available_ids = set(target_df["unique_id"].unique())
+    ids = list(ids) if ids is not None else sorted(available_ids)
+    missing = set(ids) - available_ids
+    if missing:
+        raise ValueError(
+            f"The following ids are not in target_df: {sorted(missing)}. "
+            f"Available ids: {sorted(available_ids)}"
+        )
+    plot_df = target_df[target_df["unique_id"].isin(ids)].copy()
+
+    # --- Add month and hour columns
+    plot_df["month"] = plot_df["ds"].dt.month
+    plot_df["hour"] = plot_df["ds"].dt.hour
+
+    # --- Fixed 12-color month palette (1..12) using a stable Plotly palette
+    month_colors = colors or px.colors.qualitative.Dark24  
+    n_colors = len(month_colors)
+    month_palette = {m: month_colors[(m - 1) % (min(12, n_colors))] for m in range(1, 13)}  # 12 colors
+
+    # --- Aggregate to mean and 10th/90th percentiles per uid-month-hour
+    def agg_quantiles(x):
+        return pd.Series({
+            "mean": x.mean(),
+            "q10": np.percentile(x, 10),
+            "q90": np.percentile(x, 90),
+        })
+
+    agg = (
+        plot_df.groupby(["unique_id", "month", "hour"])["y"]
+        .apply(agg_quantiles)
+        .reset_index()
+    )
+    # columns: unique_id, month, hour, level_3, [mean|q10|q90]
+    agg = agg.pivot_table(
+        index=["unique_id", "month", "hour"],
+        columns="level_3",
+        values="y"
+    ).reset_index()  # now has columns unique_id, month, hour, mean, q10, q90
+
+    # --- Build subplot grid: one row per id
+    n_rows = len(ids)
+    fig = make_subplots(
+        rows=n_rows,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        subplot_titles=tuple(ids),
+    )
+
+    show_leg_first_row = show_legend
+    month_name = {
+        1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+        7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"
+    }
+    for r, uid in enumerate(ids, start=1):
+        uid_grp = agg[agg["unique_id"] == uid].copy()
+        if uid_grp.empty:
+            continue
+
+        # maintain x ticks 0..23
+        hours_all = np.arange(0, 24, 1)
+
+        # For each month: add ribbon (q10-q90) and mean line
+        for m in range(1, 13):
+            month_grp = uid_grp[uid_grp["month"] == m].sort_values("hour")
+            if month_grp.empty:
+                continue
+
+            color = month_palette[m]
+            def ensure_rgb(c: str) -> str:
+                if c.startswith("#"):
+                    r = int(c[1:3], 16)
+                    g = int(c[3:5], 16)
+                    b = int(c[5:7], 16)
+                    return f"rgb({r},{g},{b})"
+                return c
+            def make_opaque(rgba_str: str, alpha: float) -> str:
+                color_str = rgba_str.replace("rgba", "rgb")
+                vals = color_str.strip("rgb() ").split(",")
+                r, g, b = [v.strip() for v in vals]
+                return f"rgba({r}, {g}, {b}, {alpha})"
+            band_color = make_opaque(ensure_rgb(color), 0.2)
+
+            # Build polygon for the ribbon (q90 upper, q10 lower reversed)
+            x_poly = np.concatenate([month_grp["hour"].values, month_grp["hour"].values[::-1]])
+            y_poly = np.concatenate([month_grp["q90"].values, month_grp["q10"].values[::-1]])
+
+            # Ribbon
+            fig.add_trace(
+                go.Scatter(
+                    x=x_poly,
+                    y=y_poly,
+                    fill="toself",
+                    fillcolor=band_color,
+                    line=dict(color="rgba(255,255,255,0)"),
+                    hoverinfo="skip",
+                    showlegend=False,
+                    name=f"Month {m} band",
+                ),
+                row=r, col=1
+            )
+
+            # Mean line
+            fig.add_trace(
+                go.Scatter(
+                    x=month_grp["hour"],
+                    y=month_grp["mean"],
+                    mode="lines+markers",
+                    name=month_name[m],
+                    line=dict(width=2, color=color),
+                    marker=dict(size=5),
+                    legendgroup=f"month-{m}",
+                    showlegend=(r == 1) and show_leg_first_row,
+                    hovertemplate=(
+                        f"ID: {uid}<br>"
+                        f"Month: {month_name[m]}<br>"
+                        "Hour: %{x}<br>"
+                        "Mean: %{y:.4g}<br>"
+                        "P10: %{customdata[1]:.4g}<br>"
+                        "P90: %{customdata[2]:.4g}<extra></extra>"
+                    ),
+                    customdata=np.column_stack([
+                        np.full(len(month_grp), m),
+                        month_grp["q10"].values,
+                        month_grp["q90"].values
+                    ]),
+                ),
+                row=r, col=1
+            )
+
+            # Month label near the last point
+            fig.add_annotation(
+                x=month_grp["hour"].iloc[-1],
+                y=month_grp["mean"].iloc[-1],
+                text=str(m),
+                xref=f"x{'' if r == 1 else r}",
+                yref=f"y{'' if r == 1 else r}",
+                showarrow=False,
+                font=dict(size=12, color=color),
+                xanchor="left",
+                yanchor="middle",
+                opacity=0.95,
+            )
+
+        # Axes per row
+        fig.update_xaxes(
+            tickmode="array",
+            tickvals=hours_all,
+            title_text="Hour of Day" if r == n_rows else "",
+            row=r, col=1
+        )
+        fig.update_yaxes(
+            title_text="Heat Demand (kW/h)" if r == 1 else "",
+            zeroline=False,
+            row=r, col=1
+        )
+
+    fig.update_layout(
+        title="Heat Demand by Month across Hours (80% band, P10-P90)",
+        template="plotly_white",
+        height=max(320, height_per_id * n_rows),
+        width=width,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0
+        ),
+        margin=dict(l=60, r=30, t=80, b=50),
+    )
+
+    if display_fig:
+        html = fig.to_html(include_plotlyjs="inline", full_html=False)  # offline, self-contained
+        display(HTML(html))
+
+    return fig
+
+def plot_acf_diagnostics(
+    df: pd.DataFrame,
+    cols_to_plot: Iterable[str],
+    acf_max_lag=168,
+    acf_opacity=0.7,
+    num_bins=30,
+    time_col='ds',
+    compute_residuals: bool = True,
+    ground_truth_col: str = 'y',
+    base_title: str = "Diagnostic plots",
+    alias_for_value: str = "Value",
+):
+    # Validate cols
+    cols = []
+    for m in cols_to_plot:
+        if m not in df.columns:
+            logging.warning(f"Column '{m}' not found in DataFrame. It will be skipped.")
+            continue
+        if df[m].isnull().all():
+            logging.warning(f"Column '{m}' contains only NaN values. It will be skipped.")
+            continue
+        cols.append(m)
+    if not cols:
+        raise ValueError("No valid columns to plot.")
+    
+    if time_col not in df.columns:
+        raise ValueError(f"DataFrame must contain a '{time_col}' column for time indexing.")
+    
+    # Prep
+    df = df.copy()
+    N = df[time_col].nunique()
+    df[time_col] = pd.to_datetime(df[time_col])
+    df = df.sort_values(time_col).set_index(time_col)
+
+    if compute_residuals and ground_truth_col not in df.columns:
+        raise ValueError(f"DataFrame must contain a '{ground_truth_col}' column (actuals).")
+
+    # Precompute per model
+    payload = {}
+    for m in cols:
+        if compute_residuals:
+            resid = (df[ground_truth_col] - df[m]).astype(float)
+        else:
+            resid = df[m].astype(float)
+        resid = resid.replace([np.inf, -np.inf], np.nan).dropna()
+        if resid.empty:
+            continue
+
+        samples = resid.values
+        # KDE grid
+        xmin, xmax = np.nanpercentile(samples, [0.5, 99.5])
+        if xmin == xmax:
+            xmin, xmax = xmin - 1e-6, xmax + 1e-6
+        kde = gaussian_kde(samples)
+        kde_x = np.linspace(xmin, xmax, 400)
+        kde_y = kde(kde_x)  # density
+
+        # ACF + CI
+        acf_vals = acf(samples, nlags=acf_max_lag, fft=True, missing='drop')
+        acf_lags = np.arange(len(acf_vals))
+
+        payload[m] = dict(
+            time=resid.index, resid=samples,
+            hist_x=samples, kde_x=kde_x, kde_y=kde_y,
+            acf_lags=acf_lags, acf_vals=acf_vals
+        )
+
+    if not payload:
+        raise ValueError("None of the specified models are present or residuals are empty after cleaning.")
+
+    # ---- Figure: 2 rows x 2 cols, top spans both cols ----
+    fig = make_subplots(
+        rows=2, cols=2, vertical_spacing=0.12, horizontal_spacing=0.08,
+        specs=[[{"colspan": 2}, None], [{}, {}]],
+        subplot_titles=(
+            "Lineplot over time",
+            "ACF with 95% CI",
+            "Histogram (density) + KDE"
+        )
+    )
+
+    all_cols = list(payload.keys())
+
+    # Traces per col:
+    # 1) residual line (row1,col1 spanning)
+    # 2) ACF bars (row2,col1)
+    # 3) Histogram (density) (row2,col2)
+    # 4) KDE line (row2,col2)
+    TRACES_PER_COL = 4
+
+    models_colors = px.colors.qualitative.Dark24
+    models_palette = {m: models_colors[i % len(all_cols)] for i, m in enumerate(all_cols)}
+
+    for m in all_cols:
+        d = payload[m]
+
+        # Residuals line (spanning row1 col1)
+        fig.add_trace(
+            go.Scatter(
+                x=d['time'], y=d['resid'], mode='lines',
+                name=m, legendgroup=m,
+                hovertemplate="ds=%{x}<br>value=%{y:.4f}<extra></extra>",
+                line=dict(color=models_palette[m])
+            ),
+            row=1, col=1
+        )
+
+        # ACF bars (row2 col1)
+        fig.add_trace(
+            go.Bar(
+                x=d['acf_lags'], y=d['acf_vals'], name=f"{m} ACF", legendgroup=m,
+                hovertemplate="lag=%{x}<br>acf=%{y:.4f}<extra></extra>",
+                marker=dict(color=models_palette[m]),
+            ),
+            row=2, col=1
+        )
+
+        # Histogram (density) (row2 col2)
+        fig.add_trace(
+            go.Histogram(
+                x=d['hist_x'], nbinsx=num_bins, histnorm='probability density',
+                name=f"{m} histogram (density)", legendgroup=m,
+                hovertemplate="density=%{y:.4f}<br>bin=%{x}<extra></extra>",
+                marker=dict(color=models_palette[m]),
+            ),
+            row=2, col=2
+        )
+
+        # KDE (row2 col2)
+        fig.add_trace(
+            go.Scatter(
+                x=d['kde_x'], y=d['kde_y'], mode='lines',
+                name=f"{m} KDE", legendgroup=m,
+                hovertemplate="x=%{x:.4f}<br>density=%{y:.4f}<extra></extra>",
+                line=dict(color=models_palette[m])
+            ),
+            row=2, col=2
+        )
+
+    # Initial visibility: first model only
+    vis = [False] * (len(all_cols) * TRACES_PER_COL)
+    vis[:TRACES_PER_COL] = [True] * TRACES_PER_COL
+    for t, v in zip(fig.data, vis):
+        t.visible = v
+
+    buttons = []
+    for i, m in enumerate(all_cols):
+        v = [False] * (len(all_cols) * TRACES_PER_COL)
+        start = i * TRACES_PER_COL
+        v[start:start+TRACES_PER_COL] = [True] * TRACES_PER_COL
+        buttons.append(dict(
+            label=m,
+            method="update",
+            args=[
+                {"visible": v},
+                {"title": dict(
+                    text=f"{base_title} - {all_cols[0]}",
+                    y=0.97,              # moves the title slightly down (default ≈ 1.0)
+                    x=0.08,              # center the title
+                    xanchor='left',
+                    yanchor='top',
+                )}
+            ],
+        ))
+    buttons.append(dict(
+        label="All models",
+        method="update",
+        args=[
+            {"visible": [True] * (len(all_cols) * TRACES_PER_COL)},
+            {"title": dict(
+                text=f"{base_title} - All",
+                y=0.97,              # moves the title slightly down (default ≈ 1.0)
+                x=0.08,              # center the title
+                xanchor='left',
+                yanchor='top',
+            )}
+        ],
+    ))
+
+    ci_shared = 1.96 / np.sqrt(N)
+    acf_x0, acf_x1 = 0, acf_max_lag
+
+    fig.update_layout(
+        title=dict(
+            text=f"{base_title} - {all_cols[0]}",
+            y=0.97,              # moves the title slightly down (default ≈ 1.0)
+            x=0.08,               # center the title
+            xanchor='left',
+            yanchor='top',
+        ),
+        margin=dict(t=200),  # extra top margin to accommodate title
+        updatemenus=[dict(
+            type="dropdown", x=0.01, y=1.08, xanchor="left",
+            buttons=buttons, showactive=True
+        )],
+        shapes=[
+            dict(  # CI rectangle on the ACF subplot (row=2, col=1)
+                type="rect",
+                xref="x2", yref="y2",
+                x0=acf_x0, x1=acf_x1,
+                y0=-ci_shared, y1=ci_shared,
+                fillcolor="rgba(0,0,0,0.12)",
+                line=dict(width=0),
+                layer="above"  
+            )
+        ],
+        height=900,
+        barmode='overlay',
+        legend=dict(orientation="h", yanchor="bottom", y=1.1, xanchor="left", x=0.0, tracegroupgap=12),
+    )
+
+    # Cosmetics
+    # Make hist semi-transparent
+    for tr in fig.data:
+        if isinstance(tr, go.Histogram):
+            tr.opacity = 0.55
+        if isinstance(tr, go.Bar):
+            tr.marker.line.width = 0.5
+            tr.marker.opacity = acf_opacity
+
+    # Axes labels
+    fig.update_xaxes(title_text="Time", row=1, col=1)
+    fig.update_yaxes(title_text=alias_for_value, row=1, col=1)
+
+    fig.update_xaxes(title_text="Lag", row=2, col=1)
+    fig.update_yaxes(title_text="ACF", row=2, col=1)
+
+    fig.update_xaxes(title_text=alias_for_value, row=2, col=2)
+    fig.update_yaxes(title_text="Density", row=2, col=2)
+
+    # Zero line on ACF
+    fig.add_hline(y=0, line_dash="dash", row=2, col=1)
+
+    html = fig.to_html(include_plotlyjs="inline", full_html=False)  # offline, self-contained
+    display(HTML(html))
+
+    with open("plot.html", "w", encoding="utf-8") as f:
+        f.write(html)
+
+    return payload
+
+def extract_subplot(fig_subplots: go.Figure, row: int, col: int) -> go.Figure:
+    """
+    Build a new go.Figure from the subplot at (row, col), copying:
+      - All traces in that cell (incl. secondary y)
+      - Axis styles (x and y, plus secondary y if present)
+      - Shapes, annotations, images that reference those axes
+    The new figure's subplot fills the canvas (domains = [0, 1]).
+    """
+    # Utility: remove " domain" suffix from refs like "x domain"
+    def _strip_domain(ref):
+        if isinstance(ref, str):
+            return ref.replace(" domain", "")
+        return ref
+
+    # ---- 1) Collect traces from (row, col)
+    traces = list(fig_subplots.select_traces(row=row, col=col))
+    if not traces:
+        # Even if no traces, we can still try to bring over axes and decorations
+        pass
+
+    # ---- 2) Identify the axis objects for this cell
+    xaxes = list(fig_subplots.select_xaxes(row=row, col=col))
+    yaxes = list(fig_subplots.select_yaxes(row=row, col=col))
+
+    if not xaxes or not yaxes:
+        # If we can’t resolve axes for the cell, bail out to a minimal figure with traces only
+        return go.Figure(data=traces)
+
+    # Primary x/y are the first; detect any secondary y that overlays the primary
+    x_primary = xaxes[0]
+    y_primary = yaxes[0]
+    y_secondaries = [ya for ya in yaxes[1:] if getattr(ya, "overlaying", None)]
+
+    # ---- 3) Recover the axis *IDs* (e.g., 'x', 'x2', 'y5') for mapping decorations
+    def _axis_ids_by_domain(fig, axis_type, domain_tuple):
+        ids = []
+        # Search xaxis, xaxis2, xaxis3, ... (or yaxis...)
+        for idx in range(1, 100):  # generous upper bound
+            name = f"{axis_type}axis" + ("" if idx == 1 else str(idx))
+            ax = getattr(fig.layout, name, None)
+            if ax and getattr(ax, "domain", None) == domain_tuple:
+                ids.append(name)  # e.g., 'xaxis2'
+        return ids
+
+    def _axis_name_to_ref(name):
+        # 'xaxis'  -> 'x'
+        # 'xaxis2' -> 'x2'
+        if name.endswith("axis"):
+            return name[0]
+        else:
+            return name[0] + name[len(name[0] + "axis"):]
+
+    # Domains to find corresponding *IDs*
+    x_ids_fullnames = _axis_ids_by_domain(fig_subplots, "x", tuple(x_primary.domain))
+    y_ids_fullnames = _axis_ids_by_domain(fig_subplots, "y", tuple(y_primary.domain))
+
+    # Map to 'x', 'x2', ...
+    x_refs_in_cell = {_axis_name_to_ref(n) for n in x_ids_fullnames}
+    y_refs_in_cell = {_axis_name_to_ref(n) for n in y_ids_fullnames}
+
+    # Try to identify which yref belongs to the secondary axis(es)
+    # Heuristic: any y-axis in the same domain whose 'overlaying' points to another y-axis is secondary.
+    # Build name->object map
+    name_to_yaxis = {n: getattr(fig_subplots.layout, n) for n in y_ids_fullnames}
+    y_primary_name = None
+    for n, ax in name_to_yaxis.items():
+        if not getattr(ax, "overlaying", None):
+            y_primary_name = n
+            break
+    if y_primary_name is None:
+        # fallback: treat the first as primary
+        y_primary_name = y_ids_fullnames[0]
+
+    y_secondary_names = [n for n in y_ids_fullnames if n != y_primary_name]
+    y_primary_ref = _axis_name_to_ref(y_primary_name)
+    y_secondary_refs = {_axis_name_to_ref(n) for n in y_secondary_names}
+
+    # ---- 4) Create new figure and add (deep-copied) traces with axis remapping
+    new_traces = []
+    for tr in traces:
+        trc = copy.deepcopy(tr)
+        # Normalize xaxis to 'x'
+        if getattr(trc, "xaxis", None) in x_refs_in_cell or getattr(trc, "xaxis", None) is None:
+            trc.xaxis = "x"
+        # Normalize yaxis to 'y' or 'y2' depending on original
+        current_yref = getattr(trc, "yaxis", None) or y_primary_ref
+        trc.yaxis = "y2" if current_yref in y_secondary_refs else "y"
+        new_traces.append(trc)
+
+    new_fig = go.Figure(new_traces)
+
+    # ---- 5) Copy axis styling and make domains fill the canvas
+    # Primary X
+    x_json = x_primary.to_plotly_json()
+    x_json["domain"] = [0, 1]
+    x_json["anchor"] = "y"
+    new_fig.update_layout(xaxis=x_json)
+
+    # Primary Y
+    y_json = y_primary.to_plotly_json()
+    y_json["domain"] = [0, 1]
+    y_json["anchor"] = "x"
+    new_fig.update_layout(yaxis=y_json)
+
+    # Secondary Y (if any) -> yaxis2 overlaying 'y'
+    if y_secondaries:
+        y2_json = y_secondaries[0].to_plotly_json()
+        y2_json["domain"] = [0, 1]
+        y2_json["overlaying"] = "y"
+        # Keep side if it existed, default to 'right'
+        y2_json["side"] = y2_json.get("side", "right")
+        new_fig.update_layout(yaxis2=y2_json)
+
+    # ---- 6) Copy shapes / annotations / images bound to this subplot’s axes
+    def _belongs_to_cell(xref, yref):
+        # Accept either exact axis ('x2') or domain refs ('x2 domain')
+        def _strip_domain(r):
+            return r.replace(" domain", "") if isinstance(r, str) else r
+        xr = _strip_domain(xref)
+        yr = _strip_domain(yref)
+        return (xr in x_refs_in_cell) and (yr in y_refs_in_cell)
+
+    # Shapes
+    if getattr(fig_subplots.layout, "shapes", None):
+        new_shapes = []
+        for shp in fig_subplots.layout.shapes:
+            if _belongs_to_cell(shp.xref, shp.yref):
+                shp2 = shp.to_plotly_json()
+                # Remap xref/yref into the new figure
+                shp2["xref"] = "x" + (" domain" if isinstance(shp.xref, str) and "domain" in shp.xref else "")
+                # Secondary y?
+                source_yref = shp.yref if isinstance(shp.yref, str) else None
+                target_y = "y2" if (source_yref and _strip_domain(source_yref) in y_secondary_refs) else "y"
+                shp2["yref"] = target_y + (" domain" if isinstance(shp.yref, str) and "domain" in shp.yref else "")
+                new_shapes.append(shp2)
+        if new_shapes:
+            new_fig.update_layout(shapes=new_shapes)
+
+    # Annotations
+    if getattr(fig_subplots.layout, "annotations", None):
+        new_ann = []
+        for ann in fig_subplots.layout.annotations:
+            # Only axis-bound annotations (skip 'paper'-anchored globals)
+            if isinstance(ann.xref, str) and isinstance(ann.yref, str) and _belongs_to_cell(ann.xref, ann.yref):
+                a2 = ann.to_plotly_json()
+                a2["xref"] = "x" + (" domain" if "domain" in ann.xref else "")
+                source_yref = ann.yref
+                target_y = "y2" if _strip_domain(source_yref) in y_secondary_refs else "y"
+                a2["yref"] = target_y + (" domain" if "domain" in ann.yref else "")
+                new_ann.append(a2)
+        if new_ann:
+            new_fig.update_layout(annotations=new_ann)
+
+    # Images
+    if getattr(fig_subplots.layout, "images", None):
+        new_imgs = []
+        for im in fig_subplots.layout.images:
+            if isinstance(im.xref, str) and isinstance(im.yref, str) and _belongs_to_cell(im.xref, im.yref):
+                im2 = im.to_plotly_json()
+                im2["xref"] = "x" + (" domain" if "domain" in im.xref else "")
+                source_yref = im.yref
+                target_y = "y2" if _strip_domain(source_yref) in y_secondary_refs else "y"
+                im2["yref"] = target_y + (" domain" if "domain" in im.yref else "")
+                new_imgs.append(im2)
+        if new_imgs:
+            new_fig.update_layout(images=new_imgs)
+
+    # ---- 7) Carry over a few global layout niceties (legend, template, font)
+    if getattr(fig_subplots.layout, "legend", None):
+        new_fig.update_layout(legend=fig_subplots.layout.legend)
+    if getattr(fig_subplots.layout, "template", None):
+        new_fig.update_layout(template=fig_subplots.layout.template)
+    if getattr(fig_subplots.layout, "font", None):
+        new_fig.update_layout(font=fig_subplots.layout.font)
+
+    return new_fig

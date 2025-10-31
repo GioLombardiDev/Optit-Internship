@@ -30,6 +30,7 @@ build/
 venv/
 .env/
 .env.*
+chronos-venv/
 
 # --- large or common data files (safety net) ---
 *.csv

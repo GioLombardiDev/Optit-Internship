@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Sequence, List, Optional
+from typing import Sequence, List, Optional, Iterable, Tuple
 import pandas as pd
 import numpy as np
 import seaborn as sns
@@ -10,6 +10,16 @@ from statsforecast import StatsForecast
 from statsforecast.models import SeasonalNaive
 from utilsforecast.evaluation import evaluate
 from utilsforecast.losses import rmse, mae, mape, mase
+from typing import Literal, Dict, Callable, Any
+import logging
+from tqdm.notebook import tqdm
+from IPython.display import display, HTML
+
+from .plotting import display_scrollable
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.express as px
 
 
 # -------------------------------------------------------------------------------
@@ -83,83 +93,141 @@ def me(
     )
     return wide
 
+from typing import Optional, Sequence, Tuple
+import numpy as np
+import pandas as pd
+
 def nmae(
+    df: pd.DataFrame,
+    models: Sequence[str],
+    target_df: pd.DataFrame,
+    id_col: str = "unique_id",
+    target_col: str = "y",
+    time_col: str = "ds",
+    period: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,
+) -> pd.DataFrame:
+    r"""
+    NMAE per series.
+
+    Numerator (per-series MAE): computed from `df` using the forecast rows
+    (i.e., where both the forecast columns and `target_col` are present).
+
+    Denominator (per-series mean |y|): computed from `target_df` restricted to `period`.
+    """
+    # ---- validate columns ----
+    need_df = {id_col, target_col, *models}
+    need_tgt = {id_col, time_col, target_col}
+    miss_df = need_df - set(df.columns)
+    miss_tgt = need_tgt - set(target_df.columns)
+    if miss_df:
+        raise KeyError(f"`df` missing columns: {sorted(miss_df)}")
+    if miss_tgt:
+        raise KeyError(f"`target_df` missing columns: {sorted(miss_tgt)}")
+
+    # ---- period default/validation ----
+    if period is None:
+        period = (pd.Timestamp("2019-01-01"), pd.Timestamp("2025-01-01"))
+    if not (isinstance(period, tuple) and len(period) == 2 and
+            isinstance(period[0], pd.Timestamp) and isinstance(period[1], pd.Timestamp) and
+            period[0] < period[1]):
+        raise ValueError("period must be (start_ts, end_ts) with start < end.")
+
+    # ---- numerator: per-series MAE over forecast rows in df ----
+    err_block = pd.DataFrame({m: (df[m] - df[target_col]).abs().to_numpy() for m in models},
+                             index=df.index)
+    mae_per_series = (
+        pd.concat([df[[id_col]], err_block], axis=1)
+          .groupby(id_col, as_index=False)
+          .mean(numeric_only=True)
+    )
+
+    # ---- denominator: per-series mean |y| over target_df within period ----
+    target_df = target_df.copy()
+    target_df[time_col] = pd.to_datetime(target_df[time_col])
+    mask = target_df[time_col].between(period[0], period[1])
+    norm_df = (
+        target_df.loc[mask, [id_col, target_col]]
+                 .groupby(id_col, as_index=False)
+                 .agg(norm=(target_col, lambda s: np.abs(s).mean()))
+    )
+
+    # ---- merge and normalise ----
+    wide = mae_per_series.merge(norm_df, on=id_col, how="left")
+    wide.loc[wide["norm"] == 0, "norm"] = np.nan
+    wide[models] = wide[models].div(wide["norm"], axis=0)
+    wide = wide.drop(columns="norm")
+    wide.insert(1, "metric", "nmae")
+    return wide[[id_col, "metric", *models]]
+
+def smape(
     df: pd.DataFrame,
     models: Sequence[str],
     id_col: str = "unique_id",
     target_col: str = "y",
+    use_factor_2: bool = True,
+    as_percent: bool = False,
 ):
-    r"""
-    Normalised Mean Absolute Error (NMAE) **per series**.
+    """
+    Symmetric Mean Absolute Percentage Error (SMAPE) per series.
 
-    For each series (identified by ``id_col``) the MAE of every model is
-    divided by that series' own normalisation constant:
-
-    ```       
-        NMAE_{i,m} = mean_t(|ŷ_{i,t}^{(m)} - y_{i,t}|)
-                     ─────────────────────────────────
-                            mean_t(|y_{i,t}|)
-    ```
-
-    where *i* indexes the series and *m* the model.
+    By default this uses the conventional SMAPE:
+        SMAPE = mean( 2 * |y - yhat| / (|y| + |yhat|) )
 
     Parameters
     ----------
     df : pandas.DataFrame
-        Must contain
-        * the ground-truth column *target_col*,
-        * the identifier column *id_col*, and
-        * one forecast column for each model in *models*.
-
+        DataFrame containing the ground-truth column `target_col`,
+        the identifier column `id_col`, and one forecast column for
+        each entry in `models`.
     models : Sequence[str]
-        Names of the forecast columns to evaluate.
-
-    id_col : str, default ``"unique_id"``
-        Column identifying each series.
-
-    target_col : str, default ``"y"``
-        Ground-truth column.
+        List/tuple of column names holding model forecasts.
+    id_col : str, default "unique_id"
+        Column that uniquely identifies each series.
+    target_col : str, default "y"
+        Ground-truth column name.
+    use_factor_2 : bool, default True
+        If True, include the factor 2 in the numerator (conventional SMAPE).
+        If False, uses the variant without the 2.
 
     Returns
     -------
     wide : pandas.DataFrame
-        Shape: *(n_series, 2 + n_models)* with columns::
-
-            [id_col, "metric", *models]
-
-        Every model column holds that model's **per-series NMAE**.
-        ``"metric"`` is always the string ``"nmae"``.
+        Wide-format table with columns: [id_col, "metric", *models]
+        One row per series; each model column contains that model's SMAPE.
     """
-    # Compute absolute errors for every model at once
-    err_block = pd.DataFrame(
-        {m: np.abs(df[m].to_numpy() - df[target_col].to_numpy())
-         for m in models},
-        index=df.index,
-    )
-    err_df = pd.concat([df[[id_col]], err_block], axis=1)
+    # ground-truth vector
+    y = df[target_col].to_numpy()
 
-    # Compute average mae and average |y| per series
-    mae_per_series = (
+    # build block of smape contributions per row for every model
+    smape_block = {}
+    for m in models:
+        yhat = df[m].to_numpy()
+        num = (y - yhat)
+        num = abs(num)
+        if use_factor_2:
+            num = 2 * num
+        den = abs(y) + abs(yhat)
+
+        # safe division: where den == 0 set contribution to 0
+        contrib = num.copy()
+        contrib = np.where(den <= 1e-7, 0.0, num / den)
+
+        smape_block[m] = contrib
+
+    err_df = pd.concat([df[[id_col]].reset_index(drop=True),
+                        pd.DataFrame(smape_block, index=df.index).reset_index(drop=True)],
+                       axis=1)
+
+    # Average over the time dimension (groupby series id)
+    wide = (
         err_df
         .groupby(id_col, as_index=False)
-        .mean(numeric_only=True)            # per-series MAE
-    )
-    abs_y_mean = (
-        df.groupby(id_col, as_index=False)[target_col]
-        .apply(lambda s: np.abs(s).mean())  # per-series ⟨|y|⟩
-        .rename(columns={target_col: "norm"})
+        .mean(numeric_only=True)          # mean SMAPE per series & model
     )
 
-    # Merge and normalise
-    wide = (
-        mae_per_series
-        .merge(abs_y_mean, on=id_col)
-        .assign(**{m: lambda d, m=m: d[m] / d["norm"] for m in models})
-        .drop(columns="norm")
-        .assign(metric="nmae")
-        [[id_col, "metric", *models]]
-)
+    wide = wide.assign(metric="smape")[[id_col, "metric", *models]]
     return wide
+
 
 def compute_pct_increase(evaluation_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -257,6 +325,7 @@ def custom_evaluate(
     metrics: Optional[List[str]] = None,  
     with_naive: bool = True,  
     with_pct_increase: bool = False,  # Whether to compute percentage increase compared to Naive24h
+    period_for_nmae: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,  
 ) -> pd.DataFrame:
     """
     Evaluate forecasts against the ground truth and return a
@@ -297,6 +366,11 @@ def custom_evaluate(
         Append extra rows where *metric* is suffixed by '_pct_inc' and the
         values are percentage differences from Naive24h.  Requires
         *with_naive* to be True.
+    period_for_nmae : tuple of (pd.Timestamp, pd.Timestamp), optional
+        Time range over which to compute the normaliser for NMAE.
+        Defaults to (``pd.Timestamp("2019-01-01")``,
+        ``pd.Timestamp("2025-01-01")``).  Ignored when 'nmae' is not
+        among *metrics*.
 
     Returns
     -------
@@ -308,19 +382,20 @@ def custom_evaluate(
         When *with_pct_increase* is True, every original metric gains an
         additional '_pct_inc' counterpart.
     """
-    available_metrics = ['mae', 'rmse', 'mase', 'nmae', 'mape', 'me']
+    available_metrics = ['mae', 'rmse', 'mase', 'nmae', 'mape', 'smape', 'me']
     if metrics is not None:
         if not set(metrics).issubset(set(available_metrics)):
             raise ValueError(f"metrics must be a subset of {available_metrics}.")
     else:
-        metrics = ['mae', 'rmse', 'mase', 'nmae']
+        metrics = ['mae', 'rmse', 'smape', 'nmae']
 
     str_to_func = {
         'mae': mae,
         'rmse': rmse,
         'mase': partial(mase, seasonality=24),  # Assuming a 24-hour seasonality for the naive model
-        'nmae': nmae,
+        'nmae': partial(nmae, target_df=target_df, period=period_for_nmae),
         'mape': mape,
+        'smape': smape,
         'me': me
     }
     metrics_func = [str_to_func[key] for key in metrics if key in str_to_func]
@@ -371,11 +446,12 @@ def custom_evaluate(
 
     return evaluation_df
 
-def custom_evaluate_cv(
+def evaluate_cv_forecasts(
     cv_df: pd.DataFrame,  # DataFrame with the forecasts of the models, with columns 'unique_id', 'ds', 'cutoff', and forecast columns
     metrics: Optional[List[str]] = None,  # List of metrics to compute
     target_df: Optional[pd.DataFrame] = None,  # Full training data with 'ds', 'unique_id', and 'y' columns, for mase if requested
     target_col: str = "y",  # Column name in `target_df` for the true values
+    period_for_nmae: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,  # Time range for NMAE normalization
 ) -> pd.DataFrame:
     """
     Evaluate multi-model, multi-window cross-validation results and
@@ -407,13 +483,14 @@ def custom_evaluate_cv(
         Name of the ground-truth column in ``target_df`` and the column that
         ``evaluate`` uses to compare forecasts against.
 
+    period_for_nmae : tuple of (pd.Timestamp, pd.Timestamp), optional
+        Time range over which to compute the normaliser for NMAE.
+        Defaults to (``pd.Timestamp("2019-01-01")``,
+        ``pd.Timestamp("2025-01-01")``).  Ignored when 'nmae' is not
+        among *metrics*.
+
     Returns
     -------
-    summary : pandas.DataFrame
-        Aggregated metrics: one row per ``unique_id`` and metric, with
-        two columns for every model - ``'<model>_mean'`` and
-        ``'<model>_std'`` - summarising performance across cutoffs.
-    
     all_results : pandas.DataFrame
         Window-level metrics: one row per ``unique_id`` x metric x cutoff,
         with a column for every model's score in that window.
@@ -423,9 +500,9 @@ def custom_evaluate_cv(
     # select only the sieries that are in cv_df
     target_df = target_df[target_df['unique_id'].isin(uids)].copy() if target_df is not None else None
 
-    available = ['mae', 'rmse', 'mase', 'nmae', 'mape', 'me']
+    available = ['mae', 'rmse', 'mase', 'nmae', 'mape', 'smape', 'me']
     if metrics is None:
-        metrics = ['mae', 'rmse', 'mase', 'nmae']
+        metrics = ['mae', 'rmse', 'smape', 'nmae']
     else:
         if not metrics:                         # forbids empty list
             raise ValueError("metrics list may not be empty.")
@@ -443,8 +520,9 @@ def custom_evaluate_cv(
         'mae': mae,
         'rmse': rmse,
         'mase': partial(mase, seasonality=24),  # Assuming a 24-hour seasonality for the naive model
-        'nmae': nmae,
+        'nmae': partial(nmae, target_df=target_df, period=period_for_nmae),
         'mape': mape,
+        'smape': smape,
         'me': me
     }
     metrics_func = [str_to_func[key] for key in metrics if key in str_to_func]
@@ -465,19 +543,141 @@ def custom_evaluate_cv(
 
     all_results = pd.concat(all_res, ignore_index=True).copy()
 
+    return all_results.copy()
+
+def cv_evaluation_summary(
+    all_results: pd.DataFrame,
+    stats: Literal['mean', 'median', 'std', 'wrate'] = ['mean', 'median', 'std', 'wrate'],
+    ignore_cutoffs: Optional[List[pd.Timestamp]] = None
+):
+    """
+    Summarise cross-validation results by computing mean, median,
+    standard deviation, and win rate per model.
+    Parameters
+    ----------
+    all_results : pandas.DataFrame
+        DataFrame with the window-level metrics as returned by
+        ``evaluate_cv_forecasts``.  Must contain the columns:
+
+        * ``'unique_id'`` - series identifier  
+        * ``'metric'``    - name of the accuracy metric (e.g. 'MAE')  
+        * ``'cutoff'``    - training-window end date  
+        * one column per model (e.g., ``'model_a'``, ``'model_b'`` …)
+    stats : list of str, default ['mean', 'median', 'std', 'wrate']
+        List of statistics to compute for each model.  Allowed values are
+        ``['mean', 'median', 'std', 'wrate']``.  The default is to compute all
+        four statistics.
+    Returns
+    -------
+    summary : pandas.DataFrame
+        Aggregated metrics: one row per ``unique_id`` and metric, with
+        three columns for every model - ``'<model>_mean'``, ``'<model>_median'``,
+        ``'<model>_std'``, ``'<model>_win_rate'`` - summarising performance across cutoffs.
+    """
+    # Remove from stats unwanted cutoffs
+    if ignore_cutoffs is not None:
+        if not (isinstance(ignore_cutoffs, Iterable) and 
+                all(isinstance(ts, pd.Timestamp) for ts in ignore_cutoffs)):
+            raise ValueError("ignore_cutoffs must be a iterable of pd.Timestamp values.")
+        all_results = all_results[~all_results['cutoff'].isin(ignore_cutoffs)].copy()
+
+    # validate stats
+    allowed_stats = {'mean', 'median', 'std', 'wrate'}
+    if isinstance(stats, str):
+        stats = [stats]
+    bad_stats = set(stats) - allowed_stats
+    if bad_stats:
+        raise ValueError(f"Unknown stats: {sorted(bad_stats)}. Choose from {sorted(allowed_stats)}.")
+    
     # Get model columns (exclude 'unique_id', 'metric', 'cutoff')
+    stats_by_agg = list(set(stats) & {'mean', 'median', 'std'})
     model_cols = [c for c in all_results.columns
               if c not in ("unique_id", "metric", "cutoff")]
     summary = (
         all_results
         .groupby(["unique_id", "metric"])[model_cols]    # ← keep cutoff out
-        .agg(["mean", "std"])
+        .agg(stats_by_agg)
         .pipe(lambda df: df.set_axis(
             [f"{col}_{stat}" for col, stat in df.columns], axis=1))
         .reset_index()
     )
 
-    return summary.copy(), all_results.copy()
+    if 'wrate' not in stats:
+        return summary.copy()
+    
+    # compute win rates
+    def _compute_win_rates_for_group(group_df: pd.DataFrame, models: List[str]) -> pd.Series:
+        """
+        group_df: subset of all_results for one (unique_id, metric),
+                  rows = different cutoffs, columns include model_cols.
+        returns: pd.Series indexed by models with win rates (percent).
+        """
+        # Extract the matrix of model scores (rows = windows)
+        scores = group_df.loc[:, models].to_numpy(dtype=float)  # shape (n_windows, n_models)
+
+        n_windows = scores.shape[0]
+        if n_windows == 0:
+            # no windows: return zeros
+            return pd.Series(0.0, index=models)
+
+        # find per-row minimum (nan-safe)
+        row_min = np.nanmin(scores, axis=1)  # length n_valid
+
+        # determine ties (close to min) and give fractional credit
+        # we use np.isclose to handle floating point ties
+        is_best = np.isclose(scores, row_min[:, None])  # shape (n_windows, n_models)
+        # count ties per row:
+        tie_counts = is_best.sum(axis=1)                    # shape (n_windows,)
+
+        # fractional credit: each best model gets 1/tie_count for that row
+        fractional = is_best.astype(float) / tie_counts[:, None]  # broadcasting
+        # sum fractional credits across rows -> win_counts per model
+        win_counts = fractional.sum(axis=0)  # length n_models
+
+        # normalize by total number of windows
+        win_rates = (win_counts / float(n_windows))
+
+        return pd.Series(win_rates, index=models)
+    
+        # We'll compute win rates per (unique_id, metric) group and attach columns to summary.
+    # Because for 'me' we want to compare abs(me), we'll prepare a small helper to select the right scores.
+    win_rate_frames = []  # list of DataFrames (one per group) to concat and then merge into summary
+
+    grouped = all_results.groupby(["unique_id", "metric"])
+    for (uid, metric_name), grp in grouped:
+        # create a copy of model columns for comparisons
+        grp_scores = grp.loc[:, model_cols].copy()
+
+        if metric_name == "me":
+            # For ME, define "best" as closest to zero -> compare on absolute values
+            grp_scores = grp_scores.abs()
+
+        # compute win rates (fractional tie-splitting)
+        win_rates_series = _compute_win_rates_for_group(grp_scores, model_cols)
+
+        # construct df row
+        row = {"unique_id": uid, "metric": metric_name}
+        for m in model_cols:
+            row[f"{m}_wrate"] = win_rates_series[m]
+        win_rate_frames.append(row)
+
+    if win_rate_frames:
+        win_rates_df = pd.DataFrame(win_rate_frames)
+    else:
+        # no data
+        win_rates_df = pd.DataFrame(columns=["unique_id", "metric"] + [f"{m}_wrate" for m in model_cols])
+
+    # Merge the win_rates into summary (left join on unique_id, metric)
+    # If summary lacks some (unique_id, metric) combos (unlikely), we still keep summary as base.
+    summary = summary.merge(win_rates_df, on=["unique_id", "metric"], how="left")
+
+    # Fill NaNs (if any) with 0.0 for win rates
+    for m in model_cols:
+        col = f"{m}_wrate"
+        if col in summary.columns:
+            summary[col] = summary[col].fillna(0.0)
+
+    return summary.copy()
 
 def display_metrics(
     evaluation_df: pd.DataFrame,  # DataFrame with evaluation metrics
@@ -567,11 +767,13 @@ def display_metrics(
 
 def display_cv_summary(
     summary: pd.DataFrame,
-    sort_metric: Optional[str] = None,   # e.g. "rmse", "mae", …
+    sort_metric: Optional[str] = 'mae',   # e.g. "rmse", "mae", …
     sort_stat: str = "mean",             # "mean" or "std"
     ascending: bool = True,
     by_panel: bool = False,              # True → sort within each unique_id
     show_row_numbers: bool = False,      # True → add a “#” column (0-based)
+    are_loss_diffs: bool = False,        # True → indicate loss differences
+    times_df: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     """
     Pretty-print cross-validation metrics (wide table) with optional sorting
@@ -599,6 +801,33 @@ def display_cv_summary(
     DataFrame
         The wide table that was displayed (with or without the "#" column).
     """
+    # Add times info if provided (average elapsed time per fit)
+    if times_df is not None:
+        ids = summary['unique_id'].unique()
+        if len(ids) > 1:
+            raise ValueError("times_df can only be provided when summary contains a single unique_id.")
+        id = ids[0]
+        if isinstance(times_df, pd.Series):
+            times_df = times_df.reset_index()
+        if 'model' not in times_df.columns:
+            raise KeyError("times_df must a Series with index='model' or a DataFrame with a 'model' column.")
+        times_df = times_df.rename(columns={'avg_el_per_fit':'time (s)'})
+        if 'time (s)' not in times_df.columns:
+            raise KeyError("times_df must contain a column named 'avg_el_per_fit' or 'time (s)'.")
+        times_df['unique_id'] = id
+        # add naive model if missing
+        if 'Naive24h' not in times_df['model'].values:
+            times_df = pd.concat([
+                times_df,
+                pd.DataFrame({
+                    'unique_id': [id],
+                    'model': ['Naive24h'],
+                    'time (s)': [0.0]
+                })
+            ], ignore_index=True)
+        times_df.set_index(['unique_id', 'model'], inplace=True)
+        times_df.columns = pd.MultiIndex.from_product([list(times_df.columns), ['mean']])
+
     # Reshape to a nicer (unique_id, model) × (metric, stat) cube 
     long = (
         summary
@@ -621,6 +850,15 @@ def display_cv_summary(
     )
     wide.index.names   = ["unique_id", "model"]
     wide.columns.names = ["metric", "stat"]
+
+    # Merge times if provided
+    if times_df is not None:
+        wide = wide.merge(
+            times_df,
+            left_index=True,
+            right_index=True,
+            how="left"
+        )
 
     # Optional sorting 
     if sort_metric is not None:
@@ -649,21 +887,64 @@ def display_cv_summary(
     # Styler (skip the "#" column when colouring) 
     metric_cols = [c for c in wide_disp.columns if isinstance(c, tuple)]
     mean_cols   = [c for c in metric_cols if c[1] == "mean"]
+    median_cols = [c for c in metric_cols if c[1] == "median"]
+    wrate_cols  = [c for c in metric_cols if c[1] == "wrate"]
     std_cols    = [c for c in metric_cols if c[1] == "std"]
 
     # pick columns to represent as percentages
-    perc_cols = [c for c in metric_cols if c[0] == "nmae"]
+    perc_cols = [c for c in metric_cols if c[0] in ["nmae", "smape"]]
     other_cols = [c for c in metric_cols if c not in perc_cols]
 
-    styler = (
-        wide_disp.style
-            .bar(color="lightcoral", subset=mean_cols, align="mid")
+    styler = wide_disp.style
+
+    if are_loss_diffs:
+        # Use a diverging green–white–red background gradient instead of bars
+        cmap = LinearSegmentedColormap.from_list(
+            "GreenWhiteRed",
+            ["green", "lightgray", "red"]
+        )
+        cmap_subset = mean_cols + median_cols
+        for col in cmap_subset:
+            col_vals = wide_disp[col].to_numpy()
+            col_max = np.nanmax(np.abs(col_vals))
+            if np.isnan(col_max) or col_max == 0:
+                # nothing to color for this column; skip or set a tiny epsilon
+                continue
+            styler = styler.background_gradient(
+                cmap=cmap,           # e.g. "RdBu_r" or your Green-White-Red
+                subset=[col],        # <-- IMPORTANT: one column at a time
+                vmin=-col_max,       # symmetric around 0
+                vmax= col_max,
+                axis=0               # column-wise (default), fine to be explicit
+            )
+        styler = (
+            styler
             .background_gradient(cmap="Blues", subset=std_cols)
+            .background_gradient(cmap="Greens", subset=wrate_cols, vmin=0, vmax=1)
             .format("{:.2%}", subset=perc_cols)
             .format(precision=2, subset=other_cols)
-    )
+            .format("{:.0%}", subset=wrate_cols)
+        )
+    else:
+        # Default styling: bar for means/medians
+        to_bar = [c for c in (mean_cols + median_cols) if c != ('time (s)', 'mean')]
+        styler = (
+            styler
+            .bar(color="lightcoral", subset=to_bar, align="mid")
+            .background_gradient(cmap="Blues", subset=std_cols)
+            .background_gradient(cmap="Greens", subset=wrate_cols, vmin=0, vmax=1)
+            .format("{:.2%}", subset=perc_cols)
+            .format(precision=2, subset=other_cols)
+            .format("{:.0%}", subset=wrate_cols)
+        )
+        if ('time (s)', 'mean') in wide_disp.columns:
+            styler = (
+                styler
+                .background_gradient(cmap="Oranges", subset=[('time (s)', 'mean')])
+                .format("{:.0f}", subset=[('time (s)', 'mean')])
+            )
+        
     display(styler)
-
     return wide_disp
 
 def barplot_cv(df):
@@ -883,33 +1164,6 @@ def plot_cv_metric_by_cutoff(
     
     return fig
 
-import pandas as pd
-from typing import Optional, List
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from IPython.display import HTML, display
-import plotly.express as px
-
-def display_scrollable(fig: go.Figure, container_width: str = "100%", max_height: Optional[int] = None):
-    """
-    Display a Plotly figure inside a horizontally scrollable container.
-    You can call this any time, even after updating fig width/height.
-
-    Parameters
-    ----------
-    fig : go.Figure
-        The Plotly figure to render.
-    container_width : str, default "100%"
-        CSS width of the outer container (e.g., "100%", "900px").
-    max_height : int | None
-        If provided, fixes the container's max height and enables vertical scrolling.
-    """
-    style = f"width:{container_width}; overflow-x:auto; border:0; padding:0; margin:0;"
-    if max_height is not None:
-        style += f" max-height:{max_height}px; overflow-y:auto;"
-    html = fig.to_html(include_plotlyjs="cdn", full_html=False)
-    display(HTML(f'<div style="{style}">{html}</div>'))
-
 def plotly_cv_metric_by_cutoff(
     combined_results: pd.DataFrame,
     metric: str = "mae",
@@ -917,6 +1171,9 @@ def plotly_cv_metric_by_cutoff(
     height_per_row: int = 320,
     width: int = 1400,
     title_suffix: Optional[str] = None,
+    as_lineplot: bool = False,
+    grayscale_safe: bool = False,
+    aux_df: Optional[pd.DataFrame] = None
 ) -> go.Figure:
     """
     Plot a grid of grouped bar charts (one row per `unique_id`) showing cross-validation
@@ -971,7 +1228,7 @@ def plotly_cv_metric_by_cutoff(
 
     # 4) Build subplots
     fig = make_subplots(
-        rows=nrows,
+        rows=nrows if aux_df is None else 2*nrows,
         cols=1,
         shared_xaxes=False,
         vertical_spacing=0.08,
@@ -979,8 +1236,25 @@ def plotly_cv_metric_by_cutoff(
     )
 
     # Choose a pleasant qualitative palette and map per model
-    palette = px.colors.qualitative.Plotly
-    colors = {m: palette[i % len(palette)] for i, m in enumerate(model_cols)}
+    if grayscale_safe:
+        # Distinct, high-contrast grays
+        palette = ["#111111", "#A7A5A5", "#C3C3C3", "#DDDDDD"]
+    else:
+        palette = px.colors.qualitative.Plotly
+    color_indices = range(0, len(palette), max(1, len(palette) // len(model_cols)))
+    colors = {m: palette[color_indices[i] % len(palette)] for i, m in enumerate(model_cols)}
+    # marker + line style cycles for variety
+    line_styles = ["solid", "dot", "dash", "longdash", "dashdot"]
+    markers = ["circle", "square", "diamond", "x", "triangle-up"]
+    metric_names = {"mae": "MAE", "smape": "sMAPE", "nmae": "NMAE", "rmse": "RMSE"}
+
+    if aux_df is not None:
+        cutoffs = combined_results['cutoff'].unique()
+        ds0 = cutoffs.min() + pd.Timedelta(hours=1)
+        dsMax = cutoffs.max() + pd.Timedelta(hours=24)
+        temp_hourly_df = aux_df.loc[(aux_df['ds'] >= ds0) & (aux_df['ds'] <= dsMax), ["temperature", "unique_id", "ds"]].copy()
+        temp_hourly_df['cutoff'] = temp_hourly_df["ds"].dt.floor('D') - pd.Timedelta(hours=1)
+        temp_df = temp_hourly_df.groupby(['unique_id', 'cutoff']).agg({'temperature': 'mean'}).reset_index()
 
     # 5) Add one row per series
     for r, sid in enumerate(series_list, start=1):
@@ -994,30 +1268,106 @@ def plotly_cv_metric_by_cutoff(
         x = sub["cutoff_str"].tolist()
 
         # Add one trace per model (grouped bars)
-        for m in model_cols:
+        for i, m in enumerate(model_cols):
             y_vals = sub[m].tolist()
-            fig.add_trace(
-                go.Bar(
-                    name=m,
-                    x=x,
-                    y=y_vals,
-                    marker_color=colors[m],
-                    cliponaxis=False,  # helps prevent cutoff of text
-                    hovertemplate=(
-                        f"<b>Series:</b> {sid}<br>"
-                        f"<b>Model:</b> {m}<br>"
-                        "<b>Cutoff:</b> %{x}<br>"
-                        f"<b>{metric.upper()}:</b> %{{y:.3f}}<extra></extra>"
-                    ),
-                    showlegend=(r == 1),  # show legend only once (top subplot)
-                ),
-                row=r,
-                col=1,
-            )
 
-        # Cosmetics per-row
-        fig.update_yaxes(title_text=metric, row=r, col=1)
-        fig.update_xaxes(title_text="Cutoff Date", tickangle=45, row=r, col=1)
+            if as_lineplot:
+                # ---- Line + Marker version ----
+                fig.add_trace(
+                    go.Scatter(
+                        name=m,
+                        x=x,
+                        y=y_vals,
+                        mode="lines+markers",
+                        line=dict(color=colors[m], dash=line_styles[i % len(line_styles)]),
+                        marker=dict(symbol=markers[i % len(markers)]),
+                        hovertemplate=(
+                            f"<b>Series:</b> {sid}<br>"
+                            f"<b>Model:</b> {m}<br>"
+                            "<b>Cutoff:</b> %{x}<br>"
+                            f"<b>{metric.upper()}:</b> %{{y:.3f}}<extra></extra>"
+                        ),
+                        showlegend=(r == 1),
+                    ),
+                    row=r if aux_df is None else 2*(r-1)+1,
+                    col=1,
+                )
+            else:
+                # ---- Grouped Bar version ----
+                fig.add_trace(
+                    go.Bar(
+                        name=m,
+                        x=x,
+                        y=y_vals,
+                        marker_color=colors[m],
+                        cliponaxis=False,  # helps prevent cutoff of text
+                        hovertemplate=(
+                            f"<b>Series:</b> {sid}<br>"
+                            f"<b>Model:</b> {m}<br>"
+                            "<b>Cutoff:</b> %{x}<br>"
+                            f"<b>{metric.upper()}:</b> %{{y:.3f}}<extra></extra>"
+                        ),
+                        showlegend=(r == 1),  # show legend only once (top subplot)
+                    ),
+                    row=r if aux_df is None else 2*(r-1)+1,
+                    col=1,
+                )
+
+        if aux_df is not None: # Plot temperature
+            y_vals = temp_df['temperature'].values
+            if as_lineplot:
+                # ---- Line + Marker version ----
+                fig.add_trace(
+                    go.Scatter(
+                        name="T (°C)",
+                        x=x,
+                        y=y_vals,
+                        mode="lines+markers",
+                        line=dict(color="gray" if grayscale_safe else "blue", dash="dot"),
+                        marker=dict(symbol=markers[0]),
+                        hovertemplate=(
+                            f"<b>Series:</b> {sid}<br>"
+                            "<b>Cutoff:</b> %{x}<br>"
+                            f"<b>Temperature (°C):</b> %{{y:.2f}}<extra></extra>"
+                        ),
+                        showlegend=(r == 1),
+                    ),
+                    row=2*r,
+                    col=1,
+                )
+            else:
+                # ---- Grouped Bar version ----
+                fig.add_trace(
+                    go.Bar(
+                        name="T (°C)",
+                        x=x,
+                        y=y_vals,
+                        marker_color="gray" if grayscale_safe else "blue",
+                        cliponaxis=False,  # helps prevent cutoff of text
+                        hovertemplate=(
+                            f"<b>Series:</b> {sid}<br>"
+                            "<b>Cutoff:</b> %{x}<br>"
+                            f"<b>Temperature (°C):</b> %{{y:.2f}}<extra></extra>"
+                        ),
+                        showlegend=(r == 1),  # show legend only once (top subplot)
+                    ),
+                    row=2*r,
+                    col=1,
+                )
+            top_row = 2*(r-1) + 1
+            bot_row = 2*r
+            # Make bottom row's x-axis match the top row's x-axis (shared range + zoom/pan)
+            fig.update_xaxes(matches=f"x{top_row}", row=bot_row, col=1)
+            # Hide duplicate ticks on the top row (keep only bottom)
+            fig.update_xaxes(showticklabels=False, row=top_row, col=1)
+
+            # per-row axis labels
+            fig.update_yaxes(title_text=metric_names[metric], row=top_row, col=1)
+            fig.update_yaxes(title_text="Temperature (°C)", row=bot_row, col=1)
+            fig.update_xaxes(title_text="Cutoff Date", tickangle=0, row=bot_row, col=1)
+        else:
+            fig.update_yaxes(title_text=metric_names[metric], row=r, col=1)
+            fig.update_xaxes(title_text="Cutoff Date", tickangle=0, row=r, col=1)
 
     # 6) Global layout
     fig.update_layout(
@@ -1031,32 +1381,29 @@ def plotly_cv_metric_by_cutoff(
         uniformtext_minsize=8,
         uniformtext_mode="hide",
     )
-
+    # --- White background for grayscale-safe mode ---
+    if grayscale_safe:
+        fig.update_layout(template="plotly_white")
+        fig.update_xaxes(showgrid=True, gridcolor="rgb(235,235,235)")
+        fig.update_yaxes(showgrid=True, gridcolor="rgb(235,235,235)")
     return fig
 
 
-def compute_loss_diff_stats(
+def compute_loss_diffs(
         combined_results: pd.DataFrame,
         baseline_model: str = 'Naive24h'
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Compute and summarise loss-difference (LD) statistics versus a
+    Compute loss-differences (LD) versus a
     baseline model.
 
     For every model column in *combined_results* (except the baseline),
     the function subtracts the baseline's losses to create new columns
     named ``"LD-<model>"``.  
-    It returns:
-
-    1. **summary_ld** - per-series/per-metric mean and standard deviation
-       of each LD column.
-    2. **combined_ld** - the full table containing the original metadata
-       columns (``'unique_id'``, ``'metric'``, ``'cutoff'``) plus every
-       LD column for all windows.
 
     Parameters
     ----------
-    combined_results : pandas.DataFrame
+    all_results : pandas.DataFrame
         Wide CV-evaluation table produced by your earlier pipeline.  It
         must contain:
             * ``'unique_id'`` - series identifier  
@@ -1070,15 +1417,8 @@ def compute_loss_diff_stats(
 
     Returns
     -------
-    summary_ld : pandas.DataFrame
-        One row per ``unique_id`` x ``metric``; columns::
-
-            [ 'unique_id', 'metric',
-              'LD-<model1>_mean', 'LD-<model1>_std',
-              'LD-<model2>_mean', … ]
-
-    combined_ld : pandas.DataFrame
-        Same shape as *combined_results* plus **all** LD columns, one
+    all_loss_diff : pandas.DataFrame
+        Same shape as *all_results* plus **all** LD columns, one
         row per original window.
 
     Raises
@@ -1094,15 +1434,7 @@ def compute_loss_diff_stats(
     * Negative LD ⇒ the candidate model outperforms the baseline.  
     * The aggregation step uses ``mean`` and ``std`` with
       ``numeric_only=True`` for safety.
-
-    Examples
-    --------
-    >>> summary, ld_full = display_loss_diff_stats(results_df, baseline_model="Stat")
-    >>> summary.head()
-       unique_id metric  LD-MSTL_mean  LD-MSTL_std  LD-SARIMAX_mean  LD-SARIMAX_std
-    0        S1    mae       -0.021       0.004        0.019         0.007
     """
-
     # Check if the baseline model exists in the results
     if baseline_model not in combined_results.columns:
         raise ValueError(
@@ -1120,22 +1452,12 @@ def compute_loss_diff_stats(
         .sub(combined_results[baseline_model], axis=0)   
         .add_prefix("LD-")                              
     )
-    combined_ld = pd.concat(
+    all_loss_diff = pd.concat(
         [combined_results[["unique_id", "metric", "cutoff"]], ld_block],
         axis=1,
     )
 
-    # Summarise
-    agg = (
-        combined_ld
-        .groupby(["unique_id", "metric"])[ld_block.columns] 
-        .agg(["mean", "std"])
-    )
-    agg.columns = [f"{mdl}_{stat}" for mdl, stat in agg.columns]
-    summary_ld = agg.reset_index() # bring the keys back as columns
-    summary_ld = summary_ld[["unique_id","metric",*agg.columns]]  # reorder columns
-
-    return summary_ld, combined_ld
+    return all_loss_diff
 
 def adj_r2_score(y, y_hat, T, k):
     """
@@ -1276,5 +1598,184 @@ def mae_over_thr_score(y, y_hat, y_th):
     else:
         return 0.0
 
+def by_horizon_preds(cv_df: pd.DataFrame) -> Dict[int, pd.DataFrame]:
+    """Extract hour-ahead predictions from cv_df, building a dict of DataFrames keyed by horizon in hours."""
+    df = cv_df.copy()
+
+    # Precompute horizon in hours once
+    horizon_hours = ((df["ds"] - df["cutoff"]).dt.total_seconds() // 3600).astype(int)
+    df["horizon_h"] = horizon_hours
+
+    horizons = sorted(df["horizon_h"].unique())
+    by_horizon_dict: Dict[int, pd.DataFrame] = {}
+
+    for h in horizons:
+        subset = df.loc[df["horizon_h"] == h].drop(columns=['horizon_h'])
+        by_horizon_dict[h] = subset
+
+    return by_horizon_dict
+
+def compute_error_stats_by_horizon(
+    by_horizon_dict: Dict[int, pd.DataFrame],  # Dict of DataFrames keyed by horizon in hours
+    target_df: pd.DataFrame,                   # Ground-truth series aligned with cv_df.
+    step: int = 1,                             # Evaluate every 'step' hours (e.g., 1, 3, 6).
+    nmae_period: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,
+    log_every: Optional[int] = 5,              # Log and optionally display every Nth horizon. Set to None to disable.
+    show_per_cutoff: bool = True,              # Whether to show per-cutoff plots when logging using 'by_cutoff_plot_fn'
+    show_progress: bool = True,
+    evaluate_fn: Callable[..., Any] = None,    # Function to evaluate errors, must have args 'cv_df', 'target_df', 'period_for_nmae' 
+                                               # (e.g. a partial of evaluate_cv_forecasts)
+    summarize_fn: Callable[..., Any] = None,   # Function to summarize results, must have arg 'all_results'
+                                               # (e.g. a partial of cv_evaluation_summary)
+    by_cutoff_plot_fn: Optional[Callable[..., Any]] = None, 
+                                               # Function to plot per-cutoff results, must have args 'combined_results', 
+                                               # (e.g. a partial of plotly_cv_metric_by_cutoff)
+    logger: Optional[logging.Logger] = None,
+) -> Dict[int, Any]:
+    logger = logger or logging.getLogger(__name__)
+
+    iterator: Iterable[int] = sorted(by_horizon_dict.keys())[::step]
+    horizons = list(iterator)
+    if show_progress:
+        iterator = tqdm(horizons, desc="Horizon error stats")
+
+    by_horizon_summary: Dict[int, Any] = {}
+    for idx, h in enumerate(iterator, start=1):
+        subset = by_horizon_dict[h]
+
+        results = evaluate_fn(
+            cv_df=subset,
+            target_df=target_df,
+            period_for_nmae=nmae_period,
+        )
+        summary = summarize_fn(results)
+
+        if log_every is not None and (idx - 1) % log_every == 0:
+            logger.info("Error statistics for horizon h = %d", h)
+            display_cv_summary(summary)
+            if show_per_cutoff:
+                fig = by_cutoff_plot_fn(results)
+                display_scrollable(fig)
+
+        by_horizon_summary[h] = summary
+
+    return by_horizon_summary
+
+def summaries_to_long(per_h_summ: dict) -> pd.DataFrame:
+    # per_h_summ keys are horizons, values are 4-row DataFrames (metric in rows)
+    df = pd.concat(per_h_summ, names=["horizon"])
+    df = df.reset_index(level=0).rename(columns={"level_0": "horizon"})
+    # Ensure numeric horizon
+    df["horizon"] = df["horizon"].astype(int)
+    return df
+
+def plotly_models_vs_horizon(
+    per_h_summ: dict,
+    metric: str = "mae",
+    models: list = ("LSTM", "XGBoost", "SARIMAX", "SVMR", "Naive24h"),
+    agg: str = "mean",
+    with_std_band: bool = False,
+    width: int = 900,
+    height: int = 500,
+    display_fig: bool = True
+) -> go.Figure:
+    df = summaries_to_long(per_h_summ)
+    dfm = df[df["metric"] == metric].sort_values("horizon")
+
+    fig = go.Figure()
+    palette = px.colors.qualitative.Set2
+    color_map = {m: palette[i % len(palette)] for i, m in enumerate(models)}
+
+    x = dfm["horizon"].values
+    xticks = sorted(dfm["horizon"].unique())
+
+    for i, model in enumerate(models):
+        y_col = f"{model}_{agg}"
+        std_col = f"{model}_std"
+        if y_col not in dfm.columns:
+            continue
+
+        y = dfm[y_col].values
+        c = color_map[model]
+
+        # optional ±1 std band
+        if with_std_band and std_col in dfm.columns:
+            y_std = dfm[std_col].values
+            y_lo = y - y_std
+            y_hi = y + y_std
+
+            def make_opaque(rgba_str: str, alpha: float) -> str:
+                color_str = rgba_str.replace("rgba", "rgb")
+                vals = color_str.strip("rgb() ").split(",")
+                r, g, b = [v.strip() for v in vals]
+                return f"rgba({r}, {g}, {b}, {alpha})"
+            band_color = make_opaque(c, 0.2)
+
+            # lower bound (no legend)
+            fig.add_trace(
+                go.Scatter(
+                    x=x, y=y_lo,
+                    mode="lines",
+                    line=dict(width=0),
+                    hoverinfo="skip",
+                    showlegend=False,
+                    name=f"{model} ±1 std"
+                )
+            )
+            # upper bound filled to previous
+            fig.add_trace(
+                go.Scatter(
+                    x=x, y=y_hi,
+                    mode="lines",
+                    line=dict(width=0),
+                    fill="tonexty",
+                    fillcolor=band_color,
+                    hoverinfo="skip",
+                    showlegend=False,
+                    name=f"{model} ±1 std"
+                )
+            )
+
+        # main line
+        fig.add_trace(
+            go.Scatter(
+                x=x, y=y,
+                mode="lines+markers",
+                name=f"{model} ({agg})",
+                line=dict(width=2, color=c),
+                marker=dict(size=6),
+                hovertemplate=(
+                    f"Model: {model}<br>"
+                    "Horizon: %{x}<br>"
+                    f"{metric.upper()} ({agg}): %{{y:.4g}}<extra></extra>"
+                ),
+            )
+        )
+
+    fig.update_layout(
+        title=f"{metric.upper()} vs Horizon",
+        xaxis=dict(
+            title="Forecast Horizon (hours)",
+            tickmode="array",
+            tickvals=xticks,
+            showgrid=True
+        ),
+        yaxis=dict(
+            title=metric.upper(),
+            showgrid=True,
+            zeroline=False
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        #margin=dict(l=60, r=30, t=70, b=50),
+        width=width,
+        height=height,
+        template="plotly_white"
+    )
+
+    if display_fig:
+        html = fig.to_html(include_plotlyjs="inline", full_html=False)  # offline, self-contained
+        display(HTML(html))
+
+    return fig
 
 
