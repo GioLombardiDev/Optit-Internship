@@ -1,5 +1,6 @@
+from __future__ import annotations
 from functools import partial
-from typing import Sequence, List, Optional, Iterable, Tuple
+from typing import Sequence, List, Optional, Iterable, Tuple, Literal
 import pandas as pd
 import numpy as np
 import seaborn as sns
@@ -20,7 +21,6 @@ from .plotting import display_scrollable
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px
-
 
 # -------------------------------------------------------------------------------
 # FUNCTIONS FOR EVALUATING FORECASTS AND DISPLAY / PLOT EVALUATION RESULTS
@@ -379,72 +379,95 @@ def evaluate_cv_forecasts(
     metrics: Optional[List[str]] = None,  # List of metrics to compute
     target_df: Optional[pd.DataFrame] = None,  # Full training data with 'ds', 'unique_id', and 'y' columns, for mase if requested
     target_col: str = "y",  # Column name in `target_df` for the true values
-    period_for_nmae: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,  # Time range for NMAE normalization
+    period_for_nmae: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None,  # Time range for NMAE normalisation
+    aggregate_by_dow: bool = False,  # Whether to aggregate results by day of week
 ) -> pd.DataFrame:
     """
-    Evaluate multi-model, multi-window cross-validation results and
-    return both per-window scores and an aggregated summary.
+    Evaluate multi-model, multi-window cross-validation results.
 
-    Returns
-    -------
-    all_results : pandas.DataFrame
-        Window-level metrics: one row per ``unique_id`` x metric x cutoff,
-        with a column for every model's score in that window.
+    If `aggregate_by_dow` is False:
+      - one row per unique_id x metric x cutoff (scores aggregated over the whole window)
+
+    If `aggregate_by_dow` is True:
+      - one row per unique_id x metric x cutoff x dow (scores aggregated within each window-day)
+      - expects `ds` to be datetime-like; dow is 0=Mon, ..., 6=Sun (pandas convention)
     """
-    uids = cv_df['unique_id'].unique()
+    uids = cv_df["unique_id"].unique()
 
-    # select only the sieries that are in cv_df
-    target_df = target_df[target_df['unique_id'].isin(uids)].copy() if target_df is not None else None
+    # select only the series that are in cv_df
+    target_df = target_df[target_df["unique_id"].isin(uids)].copy() if target_df is not None else None
 
-    available = ['mae', 'rmse', 'mase', 'nmae', 'mape', 'smape', 'me']
+    available = ["mae", "rmse", "mase", "nmae", "mape", "smape", "me"]
     if metrics is None:
-        metrics = ['mae', 'rmse', 'smape', 'nmae']
+        metrics = ["mae", "rmse", "smape", "nmae"]
     else:
-        if not metrics:                         # forbids empty list
+        if not metrics:
             raise ValueError("metrics list may not be empty.")
         bad = set(metrics) - set(available)
         if bad:
-            raise ValueError(
-                f"Unknown metric(s): {sorted(bad)}. "
-                f"Choose from {available}."
-            )
-    
-    if 'mase' in metrics and target_df is None:
+            raise ValueError(f"Unknown metric(s): {sorted(bad)}. Choose from {available}.")
+
+    if "mase" in metrics and target_df is None:
         raise ValueError("`target_df` is required when 'mase' is requested.")
 
     str_to_func = {
-        'mae': mae,
-        'rmse': rmse,
-        'mase': partial(mase, seasonality=24),  # Assuming a 24-hour seasonality for the naive model
-        'nmae': partial(nmae, target_df=target_df, period=period_for_nmae),
-        'mape': mape,
-        'smape': smape,
-        'me': me
+        "mae": mae,
+        "rmse": rmse,
+        "mase": partial(mase, seasonality=24),  # Assuming a 24-hour seasonality for the naive model
+        "nmae": partial(nmae, target_df=target_df, period=period_for_nmae),
+        "mape": mape,
+        "smape": smape,
+        "me": me,
     }
-    metrics_func = [str_to_func[key] for key in metrics if key in str_to_func]
-    
+    metrics_func = [str_to_func[key] for key in metrics]
+
     cv_df = cv_df.copy()
+    if aggregate_by_dow:
+        # Ensure datetime so .dt.dayofweek works
+        cv_df["ds"] = pd.to_datetime(cv_df["ds"], errors="raise")
+
     all_res = []
 
-    for cutoff in sorted(cv_df['cutoff'].unique()):
-        window_df = cv_df[cv_df['cutoff'] == cutoff].drop(columns='cutoff')
+    for cutoff in sorted(cv_df["cutoff"].unique()):
+        window_df = cv_df[cv_df["cutoff"] == cutoff].drop(columns="cutoff").copy()
 
-        kw = dict(df=window_df, metrics=metrics_func)
-        if 'mase' in metrics:                          # needs training slice
-            kw['train_df'] = target_df[target_df['ds'] <= cutoff]
+        if not aggregate_by_dow:
+            kw = dict(df=window_df, metrics=metrics_func)
+            if "mase" in metrics:
+                kw["train_df"] = target_df[target_df["ds"] <= cutoff]
 
-        eval_df = evaluate(**kw, target_col=target_col).copy()       # one call per window
-        eval_df = pd.concat([eval_df, pd.DataFrame({'cutoff': [cutoff] * len(eval_df)})], axis=1)
-        all_res.append(eval_df)
+            eval_df = evaluate(**kw, target_col=target_col).copy()
+            eval_df["cutoff"] = cutoff
+            all_res.append(eval_df)
+            continue
+
+        # aggregate_by_dow=True: compute metrics separately for each dow slice within this cutoff window
+        window_df["dow"] = window_df["ds"].dt.dayofweek
+
+        for dow in sorted(window_df["dow"].unique()):
+            slice_df = window_df[window_df["dow"] == dow].drop(columns="dow").copy()
+
+            # defensive: skip empty slices (should not happen, but cheap)
+            if slice_df.empty:
+                continue
+
+            kw = dict(df=slice_df, metrics=metrics_func)
+            if "mase" in metrics:
+                kw["train_df"] = target_df[target_df["ds"] <= cutoff]
+
+            eval_df = evaluate(**kw, target_col=target_col).copy()
+            eval_df["cutoff"] = cutoff
+            eval_df["dow"] = dow
+            all_res.append(eval_df)
 
     all_results = pd.concat(all_res, ignore_index=True).copy()
-
-    return all_results.copy()
+    return all_results
 
 def cv_evaluation_summary(
     all_results: pd.DataFrame,
     stats: Literal['mean', 'median', 'std', 'wrate'] = ['mean', 'median', 'std', 'wrate'],
-    ignore_cutoffs: Optional[List[pd.Timestamp]] = None
+    ignore_cutoffs: Optional[List[pd.Timestamp]] = None,
+    ignore_cutoffs_ids: Sequence[str] = ['F2'],
 ):
     """
     Summarise cross-validation results by computing mean, median,
@@ -458,6 +481,15 @@ def cv_evaluation_summary(
         List of statistics to compute for each model.  Allowed values are
         ['mean', 'median', 'std', 'wrate'].  The default is to compute all
         four statistics.
+    ignore_cutoffs : list of pd.Timestamp, optional
+        List of cutoff timestamps to ignore when computing the summary
+        statistics.  This can be used to exclude cutoffs that are known
+        to be problematic (e.g., due to data issues).  Default is None,
+        which means all cutoffs are included.
+    ignore_cutoffs_ids : sequence of str, optional
+        List of unique_id values for which to ignore the specified
+        ignore_cutoffs.  Default is ['F2'] to exclude known bad cutoffs
+        for facility F2.
     Returns
     -------
     summary : pandas.DataFrame
@@ -470,7 +502,11 @@ def cv_evaluation_summary(
         if not (isinstance(ignore_cutoffs, Iterable) and 
                 all(isinstance(ts, pd.Timestamp) for ts in ignore_cutoffs)):
             raise ValueError("ignore_cutoffs must be a iterable of pd.Timestamp values.")
-        all_results = all_results[~all_results['cutoff'].isin(ignore_cutoffs)].copy()
+        if not (isinstance(ignore_cutoffs_ids, Iterable) and 
+                all(isinstance(uid, str) for uid in ignore_cutoffs_ids)):
+            raise ValueError("ignore_cutoffs_ids must be a iterable of str values.")
+        mask = all_results['unique_id'].isin(ignore_cutoffs_ids) & all_results['cutoff'].isin(ignore_cutoffs)
+        all_results = all_results[~mask].copy()
 
     # validate stats
     allowed_stats = {'mean', 'median', 'std', 'wrate'}
@@ -570,6 +606,130 @@ def cv_evaluation_summary(
 
     return summary.copy()
 
+def cv_evaluation_summary_by_dow(
+    all_results: pd.DataFrame,
+    stats: Literal["mean", "median", "std", "wrate"] | List[Literal["mean", "median", "std", "wrate"]] = ["mean", "median", "std", "wrate"],
+    ignore_cutoffs: Optional[List[pd.Timestamp]] = None,
+    ignore_cutoffs_ids: Sequence[str] = ("F2",),
+) -> pd.DataFrame:
+    """
+    Summarise day-of-week aggregated CV results by computing statistics across cutoffs.
+
+    Expected input (all_results)
+    ----------------------------
+    Output of evaluate_cv_forecasts(..., aggregate_by_dow=True), i.e.:
+      - columns: unique_id, metric, cutoff, dow, and one column per model
+      - each row corresponds to a (unique_id, metric, cutoff, dow) slice, with model scores
+
+    Output
+    ------
+    summary:
+      - one row per (unique_id, metric, dow)
+      - columns: <model>_mean, <model>_median, <model>_std, <model>_wrate (depending on `stats`)
+      - win-rate is computed over cutoffs within each (unique_id, metric, dow) group
+        (fractional tie-splitting)
+      - for metric == "me", win-rate uses abs(me) so "best" means closest to zero
+    """
+    required = {"unique_id", "metric", "cutoff", "dow"}
+    missing = required - set(all_results.columns)
+    if missing:
+        raise ValueError(f"all_results is missing required column(s): {sorted(missing)}")
+
+    # Remove unwanted cutoffs for selected ids
+    if ignore_cutoffs is not None:
+        if not (
+            isinstance(ignore_cutoffs, Iterable)
+            and all(isinstance(ts, pd.Timestamp) for ts in ignore_cutoffs)
+        ):
+            raise ValueError("ignore_cutoffs must be an iterable of pd.Timestamp values.")
+        if not (
+            isinstance(ignore_cutoffs_ids, Iterable)
+            and all(isinstance(uid, str) for uid in ignore_cutoffs_ids)
+        ):
+            raise ValueError("ignore_cutoffs_ids must be an iterable of str values.")
+        mask = all_results["unique_id"].isin(ignore_cutoffs_ids) & all_results["cutoff"].isin(ignore_cutoffs)
+        all_results = all_results.loc[~mask].copy()
+
+    # validate stats
+    allowed_stats = {"mean", "median", "std", "wrate"}
+    if isinstance(stats, str):
+        stats = [stats]
+    bad_stats = set(stats) - allowed_stats
+    if bad_stats:
+        raise ValueError(f"Unknown stats: {sorted(bad_stats)}. Choose from {sorted(allowed_stats)}.")
+
+    # model columns are everything except identifiers
+    id_cols = ("unique_id", "metric", "cutoff", "dow")
+    model_cols = [c for c in all_results.columns if c not in id_cols]
+    if not model_cols:
+        raise ValueError("No model columns found in all_results.")
+
+    # numeric stats across cutoffs (group includes dow)
+    stats_by_agg = list(set(stats) & {"mean", "median", "std"})
+    if stats_by_agg:
+        summary = (
+            all_results
+            .groupby(["unique_id", "metric", "dow"])[model_cols]
+            .agg(stats_by_agg)
+            .pipe(lambda df: df.set_axis([f"{col}_{stat}" for col, stat in df.columns], axis=1))
+            .reset_index()
+        )
+    else:
+        summary = all_results[["unique_id", "metric", "dow"]].drop_duplicates().reset_index(drop=True)
+
+    if "wrate" not in stats:
+        return summary.copy()
+
+    def _compute_win_rates_for_group(scores_df: pd.DataFrame, models: List[str]) -> pd.Series:
+        """
+        scores_df: rows = cutoffs, cols = models (already transformed if needed)
+        returns: win-rate per model with fractional tie-splitting
+        """
+        scores = scores_df.loc[:, models].to_numpy(dtype=float)
+        n_windows = scores.shape[0]
+        if n_windows == 0:
+            return pd.Series(0.0, index=models)
+
+        row_min = np.nanmin(scores, axis=1)  # per-cutoff best value
+        is_best = np.isclose(scores, row_min[:, None])
+        tie_counts = is_best.sum(axis=1)
+
+        # guard: if a row is all-NaN, nanmin can raise; but if it did not, tie_counts could be 0 in weird cases
+        tie_counts = np.where(tie_counts == 0, 1, tie_counts)
+
+        fractional = is_best.astype(float) / tie_counts[:, None]
+        win_counts = fractional.sum(axis=0)
+        return pd.Series(win_counts / float(n_windows), index=models)
+
+    win_rate_rows: list[dict] = []
+    grouped = all_results.groupby(["unique_id", "metric", "dow"], sort=False)
+
+    for (uid, metric_name, dow), grp in grouped:
+        grp_scores = grp.loc[:, model_cols].copy()
+
+        if metric_name == "me":
+            grp_scores = grp_scores.abs()  # closest to 0 is best
+
+        wr = _compute_win_rates_for_group(grp_scores, model_cols)
+
+        row = {"unique_id": uid, "metric": metric_name, "dow": dow}
+        for m in model_cols:
+            row[f"{m}_wrate"] = float(wr[m])
+        win_rate_rows.append(row)
+
+    win_rates_df = pd.DataFrame(win_rate_rows) if win_rate_rows else pd.DataFrame(
+        columns=["unique_id", "metric", "dow"] + [f"{m}_wrate" for m in model_cols]
+    )
+
+    summary = summary.merge(win_rates_df, on=["unique_id", "metric", "dow"], how="left")
+
+    for m in model_cols:
+        col = f"{m}_wrate"
+        if col in summary.columns:
+            summary[col] = summary[col].fillna(0.0)
+
+    return summary.copy()
+
 def display_metrics(
     evaluation_df: pd.DataFrame,  # DataFrame with evaluation metrics
 ):
@@ -636,7 +796,7 @@ def display_cv_summary(
     sort_metric: Optional[str] = 'mae',   # e.g. "rmse", "mae", …
     sort_stat: str = "mean",             # "mean" or "std"
     ascending: bool = True,
-    by_panel: bool = False,              # True → sort within each unique_id
+    by_panel: bool = True,               # True → sort within each unique_id
     show_row_numbers: bool = False,      # True → add a “#” column (0-based)
     are_loss_diffs: bool = False,        # True → indicate loss differences
     times_df: Optional[pd.Series] = None,
@@ -1057,7 +1217,7 @@ def plotly_cv_metric_by_cutoff(
     # marker + line style cycles for variety
     line_styles = ["solid", "dot", "dash", "longdash", "dashdot"]
     markers = ["circle", "square", "diamond", "x", "triangle-up"]
-    metric_names = {"mae": "MAE", "smape": "sMAPE", "nmae": "NMAE", "rmse": "RMSE"}
+    metric_names = {"mae": "MAE", "smape": "sMAPE", "nmae": "NMAE", "rmse": "RMSE", "me": "ME", "smape": "sMAPE"}
 
     if aux_df is not None:
         cutoffs = combined_results['cutoff'].unique()
@@ -1086,7 +1246,7 @@ def plotly_cv_metric_by_cutoff(
                 # ---- Line + Marker version ----
                 fig.add_trace(
                     go.Scatter(
-                        name=m.split('-')[1] if '-' in m else m,
+                        name=m[len("LD-"):] if m.startswith("LD-") else m,
                         x=x,
                         y=y_vals,
                         mode="lines", #"lines+markers"
@@ -1107,7 +1267,7 @@ def plotly_cv_metric_by_cutoff(
                 # ---- Grouped Bar version ----
                 fig.add_trace(
                     go.Bar(
-                        name=m.split('-')[1] if '-' in m else m,
+                        name=m[len("LD-"):] if m.startswith("LD-") else m,
                         x=x,
                         y=y_vals,
                         marker_color=colors[m],

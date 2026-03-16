@@ -777,6 +777,7 @@ def plotly_cutoffs_with_exog(
     levels: Optional[Sequence[int]] = None,
     models: Optional[Sequence[str]] = None,
     id: Optional[str] = None,
+    show_target: bool = True,
     highlight_dayofweek: bool = False,
     order_of_models: Optional[Sequence[str]] = None,
     alpha: float = 0.9,
@@ -917,22 +918,26 @@ def plotly_cutoffs_with_exog(
     mask_train = (target_id_df["ds"] >= plot_start) & (target_id_df["ds"] <= plot_end)
     train_grp = target_id_df.loc[mask_train, ["ds", target_col]]
 
-    fig.add_trace(
-        go.Scatter(
-            x=train_grp["ds"], y=train_grp[target_col],
-            name="Target", mode="lines",
-            line=dict(width=2, color="black"),
-            legendgroup="__target__", showlegend=True
-        ),
-        row=1, col=1
-    )
+    if show_target:
+        fig.add_trace(
+            go.Scatter(
+                x=train_grp["ds"], y=train_grp[target_col],
+                name="Target", mode="lines",
+                line=dict(width=2, color="black"),
+                legendgroup="__target__", showlegend=True
+            ),
+            row=1, col=1
+        )
 
     # --- Fixed color mapping per model
     if grayscale_safe:
         palette = ["#111111", "#B3B2B2"]
         ordered_models = ['placeholder'] + ordered_models  # shift by 1
     else:
-        palette = px.colors.qualitative.Set2
+        if len(ordered_models) <= 5:
+            palette = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00"]
+        else:
+            palette = px.colors.qualitative.Set2
     step = max(1, len(palette) // max(1, len(ordered_models)))
     color_map = {
         m: palette[(i * step) % len(palette)]
@@ -2034,7 +2039,6 @@ import plotly.express as px
 from typing import Optional, Iterable, Any, List, Tuple
 from IPython.display import HTML, display
 
-
 def plotly_weekly_seasonality(
     target_df: pd.DataFrame,
     *,
@@ -2050,6 +2054,18 @@ def plotly_weekly_seasonality(
     vertical_spacing: float = 0.12,
     horizontal_spacing: float = 0.08,
     annotate: bool = True,
+    # PARAMETERS FOR TEXT CONTROL
+    legend_font_size: int = 12,
+    legend_itemwidth: int = 30,  # Width of legend color boxes
+    legend_itemclick: str = "toggle",  # "toggle", "toggleothers", False
+    title_font_size: int = 16,
+    axis_title_font_size: int = 14,
+    axis_tick_font_size: int = 12,
+    annotation_font_size: int = 11,
+    annotation_max_width: int = 60,  # Maximum width for annotations in pixels
+    subplot_title_font_size: int = 14,
+    wrap_legend_labels: bool = True,  # Wrap long legend labels
+    legend_max_char_width: int = 15,  # Characters before wrapping
 ) -> go.Figure:
     """
     Weekly seasonality Plotly figure.
@@ -2102,7 +2118,36 @@ def plotly_weekly_seasonality(
         if group_labels is None:
             default_labels = {i: f"G{i+1}" for i in range(n_groups)}
         else:
-            default_labels = {i: lab for i, lab in enumerate(group_labels)}
+            # Apply text wrapping to legend labels if requested
+            if wrap_legend_labels:
+                wrapped_labels = []
+                for label in group_labels:
+                    if len(label) > legend_max_char_width:
+                        # Simple word wrap
+                        words = label.split()
+                        lines = []
+                        current_line = []
+                        current_length = 0
+                        
+                        for word in words:
+                            if current_length + len(word) + 1 <= legend_max_char_width:
+                                current_line.append(word)
+                                current_length += len(word) + 1
+                            else:
+                                if current_line:
+                                    lines.append(" ".join(current_line))
+                                current_line = [word]
+                                current_length = len(word)
+                        
+                        if current_line:
+                            lines.append(" ".join(current_line))
+                        
+                        wrapped_labels.append("<br>".join(lines))
+                    else:
+                        wrapped_labels.append(label)
+                default_labels = {i: lab for i, lab in enumerate(wrapped_labels)}
+            else:
+                default_labels = {i: lab for i, lab in enumerate(group_labels)}
         mode = "custom"
 
     if plot_df.empty:
@@ -2142,7 +2187,7 @@ def plotly_weekly_seasonality(
     n_rows = math.ceil(n_ids / n_cols)
 
     # subplot titles padded to rows*cols
-    titles = [f"Series {uid}" for uid in ids] + [""] * (n_rows * n_cols - n_ids)
+    titles = [f"Site n°{uid[-1]}" for uid in ids] + [""] * (n_rows * n_cols - n_ids)
 
     fig = make_subplots(
         rows=n_rows,
@@ -2152,6 +2197,27 @@ def plotly_weekly_seasonality(
         vertical_spacing=vertical_spacing,
         horizontal_spacing=horizontal_spacing,
         subplot_titles=tuple(titles),
+    )
+    
+    # Update subplot title font size
+    fig.update_annotations(font_size=subplot_title_font_size)
+    
+    # Add y-axis label
+    fig.update_layout(
+        yaxis_title=None,
+        annotations=list(fig.layout.annotations) + [
+            dict(
+                text="Heat Demand (kWh)",
+                x=-0.06, y=0.5,
+                xref="paper", yref="paper",
+                xanchor="right",
+                yanchor="middle",
+                textangle=-90,
+                showarrow=False,
+                font=dict(size=axis_title_font_size),
+            )
+        ],
+        margin=dict(l=90)
     )
 
     # small helpers for color handling
@@ -2240,17 +2306,23 @@ def plotly_weekly_seasonality(
 
             # inline label on last point
             if annotate:
+                # Truncate annotation text if too long
+                annotation_text = label
+                if len(annotation_text) > 15:  # Simple truncation
+                    annotation_text = annotation_text[:12] + "..."
+                
                 fig.add_annotation(
                     x=x_vals[-1],
                     y=mean_vals[-1],
-                    text=label,
+                    text=annotation_text,
                     xref=f"x{axis_suffix}",
                     yref=f"y{axis_suffix}",
                     showarrow=False,
-                    font=dict(size=11, color=color),
+                    font=dict(size=annotation_font_size, color=color),
                     xanchor="left",
                     yanchor="middle",
                     opacity=0.95,
+                    width=annotation_max_width,
                 )
 
         # axis formatting for this subplot
@@ -2264,6 +2336,8 @@ def plotly_weekly_seasonality(
             mirror=True,
             row=row,
             col=col,
+            title_font=dict(size=axis_title_font_size),
+            tickfont=dict(size=axis_tick_font_size),
         )
         fig.update_yaxes(
             linewidth=1,
@@ -2271,31 +2345,53 @@ def plotly_weekly_seasonality(
             mirror=True,
             row=row,
             col=col,
-            dtick=200
+            dtick=200,
+            title_font=dict(size=axis_title_font_size),
+            tickfont=dict(size=axis_tick_font_size),
         )
 
     row = math.ceil(n_rows / 2)
     fig.update_yaxes(
-        title_text="Heat Demand (kWh)" if (col == 1) else "",
         zeroline=False,
         row=row,
         col=col,
     )
 
     title_suffix = " (grouped by month)" if mode == "month" else " (grouped by custom periods)"
+    
+    # Configure legend with better text control
+    legend_config = dict(
+        orientation="h",
+        yanchor="bottom",
+        y=1.07,
+        xanchor="left",
+        x=0,
+        font=dict(size=legend_font_size),
+        itemwidth=legend_itemwidth,
+        itemclick=legend_itemclick,
+        itemsizing="constant",  # Keeps legend items consistent size
+        # Add legend group click behavior
+        groupclick="toggleitem" if legend_itemclick == "toggle" else legend_itemclick,
+    )
+    
+    # Adjust layout based on number of legend items
+    if show_legend and len(unique_groups) > 6:
+        # If many legend items, reduce font size and adjust position
+        legend_config["font"]["size"] = max(10, legend_font_size - 2)
+        legend_config["y"] = 1.12  # Move legend higher
+    
     fig.update_layout(
         height=max(320, height_per_id * n_rows),
         width=width,
         template="plotly_white",
-        title="Heat Demand across Hours of Week" + title_suffix,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.03,
-            xanchor="left",
-            x=0,
+        title=dict(
+            text="Heat Demand across Hours of Week" + title_suffix,
+            font=dict(size=title_font_size),
+            x=0.5,  # Center title
+            xanchor="center",
         ),
-        margin=dict(l=60, r=30, t=80, b=50),
+        legend=legend_config,
+        margin=dict(l=60, r=30, t=100 if show_legend else 80, b=50),
     )
 
     if display_fig:
@@ -2316,6 +2412,7 @@ def plot_acf_diagnostics(
     base_title: str = "Diagnostic plots",
     alias_for_value: str = "Value",
 ) -> Tuple[Dict[str, Any], go.Figure]:
+
     # Validate cols
     cols = []
     for m in cols_to_plot:
@@ -2389,8 +2486,14 @@ def plot_acf_diagnostics(
 
     TRACES_PER_COL = 4
 
-    models_colors = px.colors.qualitative.Dark24
-    models_palette = {m: models_colors[i % len(all_cols)] for i, m in enumerate(all_cols)}
+    # models_colors = px.colors.qualitative.Dark24
+    # models_palette = {m: models_colors[i % len(all_cols)] for i, m in enumerate(all_cols)}
+
+    # 5-model, colourblind-friendly palette (Okabe--Ito)
+    colors5 = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00"]
+    if len(cols_to_plot) == 3:
+        colors5 = ["#0072B2", "#CC79A7", "#E69F00"]
+    models_palette = {m: colors5[i % len(colors5)] for i, m in enumerate(all_cols)}
 
     for m in all_cols:
         d = payload[m]
